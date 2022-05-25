@@ -300,6 +300,12 @@ Column options
   so they will cause an error when read by oracle_fdw.  This option only
   make sense for `character`, `character varying` and `text` columns.
 
+- **column_name** (optional)
+
+  Column name on foreign table is the same as the one on remote table by default.
+  Changing column name on foreign table by ALTER command to map column on foreign table
+  to the appropriate column on remote table.
+
 4 Usage
 =======
 
@@ -474,6 +480,7 @@ such triggers make use of the RETURNING clause mentioned above.
 While modifying foreign data works, the performance is not particularly
 good, specifically when many rows are affected, because (owing to the way
 foreign data wrappers work) each row has to be treated individually.
+UPDATE/DELETE command can be forwarded to Oracle for better performance.
 
 Transactions are forwarded to Oracle, so BEGIN, COMMIT, ROLLBACK and
 SAVEPOINT work as expected.  Prepared statements involving Oracle are
@@ -596,6 +603,87 @@ following:
 Note that IMPORT FOREIGN SCHEMA does not work with Oracle server 8i;
 see the [Problems](#8-problems) section for details.
 
+
+Support for function pushdown
+-----------------------------
+
+- List of built-in aggregate functions of PostgreSQL can be pushed down to Oracle
+
+```
+sum, avg, max, min, stddev, count, variance, corr, covar_pop, covar_samp, cume_dist,
+dense_rank, percent_rank, stddev_pop, stddev_samp, var_pop, var_samp, percentile_cont,
+percentile_disc.
+```
+
+- List of unique aggregate functions of Oracle needs stub function on PostgreSQL
+
+```
+approx_count_distinct.
+```
+
+- List of built-in numeric functions of PostgreSQL can be pushed down to Oracle
+
+```
+abs, acos, asin, atan, atan2, ceil, ceiling, cos, cosh, exp, floor, ln, log, mod,
+pow, power, round, sign, sin, sinh, sqrt, tan, tanh.
+```
+
+Some functions of Oracle have dirrent name compared to PostgreSQL but have the same
+functionality, so can use both syntax on PostgreSQL
+
+| Postgres syntax   | Oracle coressponding syntax      |
+|-------------------|----------------------------------|
+| ceiling           | ceil                             |
+| pow               | power                            |
+
+-- List of unique numeric functions of Oracle need stub function on PostgreSQL
+
+```
+oracle_round
+```
+
+| Postgres syntax   | Oracle coressponding syntax      |
+|-------------------|----------------------------------|
+| oracle_round      | round                            |
+
+- List of built-in string functions of PostgreSQL can be pushed down to Oracle
+
+```
+ascii, char_length, character_length, chr, initcap, length, lower, lpad, ltrim,
+octet_length, position, replace, rpad, rtrim, regexp_replace, strpos, subtr, substring,
+translate, trunc, upper, width_bucket, to_char, to_date, to_number, to_timestamp.
+```
+
+Some functions of Oracle have dirrent name compared to PostgreSQL but have the same
+functionality, so can use both syntax on PostgreSQL
+
+| Postgres syntax   | Oracle coressponding syntax      |
+|-------------------|----------------------------------|
+| char_length       | length                           |
+| character_length  | length                           |
+| octet_length      | lengthb                          |
+| position          | instr                            |
+| strpos            | instr                            |
+| substring         | substr                           |
+
+- List of unique date/time functions of Oracle need stub functions on PostgreSQL
+
+```
+add_months, last_day, oracle_current_date, oracle_current_timestamp, oracle_localtimestamp,
+oracle_extract, dbtimezone, from_tz, months_between, new_time, next_day, numtodsinterval,
+numtoyminterval
+```
+
+Some functions need prefix oracle because they have the same name with the built-in functions
+of PostgreSQL, but have different specificaiton in use.
+
+| Postgres syntax          | Oracle coressponding syntax      |
+|--------------------------|----------------------------------|
+| oracle_current_date      | current_date                     |
+| oracle_current_timestamp | current_timestamp                |
+| oracle_localtimestamps   | localtimestamp                   |
+| oracle_extract           | extract                          |
+
 5 Installation Requirements
 ===========================
 
@@ -605,7 +693,7 @@ Oracle client, although I could only test it on Linux and Windows.
 PostgreSQL 9.3 or better is required.
 
 Due to an API break in a PostgreSQL minor release, the following PostgreSQL
-versions cannot be used: 9.6.0 to 9.6.8 and 10.0 to 10.3
+versions cannot be used: 10.0 to 10.3
 
 oracle_fdw is written for standard open source PostgreSQL.
 Forks of PostgreSQL, such as "PostgresPro" and "Postgres-XL", are likely to
@@ -760,6 +848,9 @@ The Oracle database must be prepared as follows:
   the regression test scripts).  The user needs CREATE SESSION and CREATE TABLE
   system privileges and enough quota on its default tablespace, as well as
   SELECT privileges on V$SQL and V$SQL_PLAN.
+
+- A user `test` with password `test` must exist for the tests oracle_fdw_post.sql
+and selectfunc.sql
 
 Set the environment for the PostgreSQL server so that it can establish an
 Oracle connection without connect string:

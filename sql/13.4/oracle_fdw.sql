@@ -10,7 +10,7 @@ CREATE EXTENSION oracle_fdw;
 -- TWO_TASK or ORACLE_HOME and ORACLE_SID must be set in the server's environment for this to work
 CREATE SERVER oracle FOREIGN DATA WRAPPER oracle_fdw OPTIONS (dbserver '', isolation_level 'read_committed', nchar 'true');
 
-CREATE USER MAPPING FOR CURRENT_ROLE SERVER oracle OPTIONS (user 'SCOTT', password 'tiger');
+CREATE USER MAPPING FOR CURRENT_USER SERVER oracle OPTIONS (user 'SCOTT', password 'tiger');
 
 -- drop the Oracle tables if they exist
 DO
@@ -468,8 +468,9 @@ EXPLAIN (COSTS off) SELECT d FROM typetest1 ORDER BY lc LIMIT 2;
 EXPLAIN (COSTS off) SELECT * FROM qtest LIMIT 1 OFFSET 2;
 SELECT * FROM qtest LIMIT 1 OFFSET 2;
 -- no LIMIT push-down if there is a GROUP BY clause
-EXPLAIN (COSTS off) SELECT d, count(*) FROM typetest1 GROUP BY d LIMIT 2;
-SELECT d, count(*) FROM typetest1 GROUP BY d LIMIT 2;
+-- use ORDER BY to ensure the stable result
+EXPLAIN (COSTS off) SELECT d, count(*) FROM typetest1 GROUP BY d ORDER BY 1 LIMIT 2;
+SELECT d, count(*) FROM typetest1 GROUP BY d ORDER BY 1 LIMIT 2;
 -- no LIMIT push-down if there is an aggregate function
 EXPLAIN (COSTS off) SELECT 12 - count(*) FROM typetest1 LIMIT 1;
 SELECT 12 - count(*) FROM typetest1 LIMIT 1;
@@ -512,3 +513,4 @@ SELECT id FROM f_typetest1() ORDER BY id;
 -- clean up
 RESET SESSION AUTHORIZATION;
 DROP ROLE duff;
+DROP EXTENSION oracle_fdw CASCADE;

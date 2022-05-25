@@ -3,8 +3,69 @@
 \set VERBOSITY terse
 SET client_min_messages = INFO;
 
+CREATE EXTENSION oracle_fdw;
+
+-- TWO_TASK or ORACLE_HOME and ORACLE_SID must be set in the server's environment for this to work
+CREATE SERVER oracle FOREIGN DATA WRAPPER oracle_fdw OPTIONS (dbserver '', isolation_level 'read_committed', nchar 'true');
+CREATE USER MAPPING FOR CURRENT_USER SERVER oracle OPTIONS (user 'SCOTT', password 'tiger');
+
+-- create the foreign tables
+CREATE FOREIGN TABLE typetest1 (
+   id  integer OPTIONS (key 'yes') NOT NULL,
+   q   double precision,
+   c   character(10),
+   nc  character(10),
+   vc  character varying(10),
+   nvc character varying(10),
+   lc  text,
+   r   bytea,
+   u   uuid,
+   lb  bytea,
+   lr  bytea,
+   b   boolean,
+   num numeric(7,5),
+   fl  float,
+   db  double precision,
+   d   date,
+   ts  timestamp with time zone,
+   ids interval,
+   iym interval
+) SERVER oracle OPTIONS (table 'TYPETEST1');
+ALTER FOREIGN TABLE typetest1 DROP q;
+
+-- a table that is missing some fields
+CREATE FOREIGN TABLE shorty (
+   id  integer OPTIONS (key 'yes') NOT NULL,
+   c   character(10)
+) SERVER oracle OPTIONS (table 'TYPETEST1');
+
+-- a table that has some extra fields
+CREATE FOREIGN TABLE longy (
+   id  integer OPTIONS (key 'yes') NOT NULL,
+   c   character(10),
+   nc  character(10),
+   vc  character varying(10),
+   nvc character varying(10),
+   lc  text,
+   r   bytea,
+   u   uuid,
+   lb  bytea,
+   lr  bytea,
+   b   boolean,
+   num numeric(7,5),
+   fl  float,
+   db  double precision,
+   d   date,
+   ts  timestamp with time zone,
+   ids interval,
+   iym interval,
+   x   integer
+) SERVER oracle OPTIONS (table 'TYPETEST1');
+
 /* analyze table for reliable output */
 ANALYZE typetest1;
+ANALYZE longy;
+ANALYZE shorty;
 
 /* default setting sometimes leads to merge joins */
 SET enable_mergejoin = off;
@@ -257,3 +318,6 @@ ANALYZE typetest1;
 -- costs with statistics
 EXPLAIN SELECT t1.id, t2.id FROM typetest1 t1, typetest1 t2 WHERE t1.c = t2.c;
 EXPLAIN SELECT t1.id, t2.id FROM typetest1 t1, typetest1 t2 WHERE t1.c <> t2.c;
+
+-- clean up
+DROP EXTENSION oracle_fdw CASCADE;

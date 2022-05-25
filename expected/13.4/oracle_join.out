@@ -1,0 +1,1397 @@
+\pset border 1
+\pset linestyle ascii
+\set VERBOSITY terse
+SET client_min_messages = INFO;
+CREATE EXTENSION oracle_fdw;
+-- TWO_TASK or ORACLE_HOME and ORACLE_SID must be set in the server's environment for this to work
+CREATE SERVER oracle FOREIGN DATA WRAPPER oracle_fdw OPTIONS (dbserver '', isolation_level 'read_committed', nchar 'true');
+CREATE USER MAPPING FOR CURRENT_USER SERVER oracle OPTIONS (user 'SCOTT', password 'tiger');
+-- create the foreign tables
+CREATE FOREIGN TABLE typetest1 (
+   id  integer OPTIONS (key 'yes') NOT NULL,
+   q   double precision,
+   c   character(10),
+   nc  character(10),
+   vc  character varying(10),
+   nvc character varying(10),
+   lc  text,
+   r   bytea,
+   u   uuid,
+   lb  bytea,
+   lr  bytea,
+   b   boolean,
+   num numeric(7,5),
+   fl  float,
+   db  double precision,
+   d   date,
+   ts  timestamp with time zone,
+   ids interval,
+   iym interval
+) SERVER oracle OPTIONS (table 'TYPETEST1');
+ALTER FOREIGN TABLE typetest1 DROP q;
+-- a table that is missing some fields
+CREATE FOREIGN TABLE shorty (
+   id  integer OPTIONS (key 'yes') NOT NULL,
+   c   character(10)
+) SERVER oracle OPTIONS (table 'TYPETEST1');
+-- a table that has some extra fields
+CREATE FOREIGN TABLE longy (
+   id  integer OPTIONS (key 'yes') NOT NULL,
+   c   character(10),
+   nc  character(10),
+   vc  character varying(10),
+   nvc character varying(10),
+   lc  text,
+   r   bytea,
+   u   uuid,
+   lb  bytea,
+   lr  bytea,
+   b   boolean,
+   num numeric(7,5),
+   fl  float,
+   db  double precision,
+   d   date,
+   ts  timestamp with time zone,
+   ids interval,
+   iym interval,
+   x   integer
+) SERVER oracle OPTIONS (table 'TYPETEST1');
+/* analyze table for reliable output */
+ANALYZE typetest1;
+ANALYZE longy;
+ANALYZE shorty;
+/* default setting sometimes leads to merge joins */
+SET enable_mergejoin = off;
+/*
+ * Cases that should be pushed down.
+ */
+-- inner join two tables
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1, typetest1  t2 WHERE t1.c = t2.c ORDER BY t1.id, t2.id;
+                                                                                                 QUERY PLAN                                                                                                  
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*72f302f9323c69d18800e34769955c2b*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."C" = r2."C")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1, typetest1  t2 WHERE t1.c = t2.c ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  3 |  3
+  4 |  4
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT length(t1.lb), length(t2.lc) FROM typetest1  t1 JOIN typetest1  t2 ON (t1.id + t2.id = 2) ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                               
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*78c2ad6d3450070100e2949dc147529f*/ r1."LB", r2."LC", r1."ID", r2."ID" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON ((r1."ID" + r2."ID") = 2)) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT length(t1.lb), length(t2.lc) FROM typetest1  t1 JOIN typetest1  t2 ON (t1.id + t2.id = 2) ORDER BY t1.id, t2.id;
+ length | length 
+--------+--------
+      5 |     22
+(1 row)
+
+-- inner join two tables with ORDER BY clause, but ORDER BY does not get pushed down
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 JOIN typetest1  t2 USING (ts, num) ORDER BY t1.id, t2.id;
+                                                                                                               QUERY PLAN                                                                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*e28f0f6e72c8a83f73c0bcaf8633714a*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."TS" = r2."TS") AND (r1."NUM" = r2."NUM")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 JOIN typetest1  t2 USING (ts, num) ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  3 |  3
+(2 rows)
+
+-- natural join two tables
+EXPLAIN (COSTS off)
+SELECT id FROM typetest1  NATURAL JOIN shorty  ORDER BY id;
+                                                                                             QUERY PLAN                                                                                             
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*350d54bf911ed5ad1249162b6923d099*/ r1."ID" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."ID" = r2."ID") AND (r1."C" = r2."C")) ORDER BY r1."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT id FROM typetest1  NATURAL JOIN shorty  ORDER BY id;
+ id 
+----
+  1
+  3
+  4
+(3 rows)
+
+-- table with column that does not exist in Oracle (should become NULL)
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.x FROM typetest1  t1 JOIN longy t2  ON t1.c = t2.c ORDER BY t1.id, t2.x;
+                                                                                                                  QUERY PLAN                                                                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*1b288c57c3cd347b4e4f6663f2364aa6*/ r1."ID", CAST(NULL AS NUMBER(10)) FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."C" = r2."C")) ORDER BY r1."ID" ASC NULLS LAST, CAST(NULL AS NUMBER(10)) ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.x FROM typetest1  t1 JOIN longy t2  ON t1.c = t2.c ORDER BY t1.id, t2.x;
+ id | x 
+----+---
+  1 |  
+  3 |  
+  4 |  
+(3 rows)
+
+-- left outer join two tables
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d ORDER BY t1.id, t2.id;
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*2bd8fb89ae791e868210662db9feadbe*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 LEFT JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  3 |  3
+  4 |   
+(3 rows)
+
+-- right outer join two tables
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d ORDER BY t1.id, t2.id;
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*5d2e14ac8256fb8bff6646e7cc4f1db3*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r2 LEFT JOIN  "TYPETEST1" r1 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  3 |  3
+    |  4
+(3 rows)
+
+-- full outer join two tables
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d ORDER BY t1.id, t2.id;
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*6db14dcae077175681d8e5a9c357002c*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 FULL JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  3 |  3
+  4 |   
+    |  4
+(4 rows)
+
+-- joins with filter conditions
+---- inner join with WHERE clause
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d WHERE t1.id > 1 ORDER BY t1.id, t2.id;
+                                                                                                          QUERY PLAN                                                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*94c53f84d67649c6216a542043477777*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D") AND (r1."ID" > 1)) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d WHERE t1.id > 1 ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  3 |  3
+(1 row)
+
+---- left outer join with WHERE clause
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d WHERE t1.id > 1 ORDER BY t1.id, t2.id;
+                                                                                                           QUERY PLAN                                                                                                           
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*27c929635f56f9a54e8b751f43a0066d*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 LEFT JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) WHERE (r1."ID" > 1) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d WHERE t1.id > 1 ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  3 |  3
+  4 |   
+(2 rows)
+
+---- right outer join with WHERE clause
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d WHERE t1.id > 1 ORDER BY t1.id, t2.id;
+                                                                                                          QUERY PLAN                                                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*94c53f84d67649c6216a542043477777*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D") AND (r1."ID" > 1)) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d WHERE t1.id > 1 ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  3 |  3
+(1 row)
+
+---- full outer join with WHERE clause
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d WHERE t1.id > 1 ORDER BY t1.id, t2.id;
+                                                                                                           QUERY PLAN                                                                                                           
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*27c929635f56f9a54e8b751f43a0066d*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 LEFT JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) WHERE (r1."ID" > 1) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(2 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d WHERE t1.id > 1 ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  3 |  3
+  4 |   
+(2 rows)
+
+/*
+ * Cases that should not be pushed down.
+ */
+-- join expression cannot be pushed down
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1, typetest1  t2 WHERE t1.lc = t2.lc ORDER BY t1.id, t2.id;
+                                                 QUERY PLAN                                                 
+------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Join
+         Hash Cond: (t1.lc = t2.lc)
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*3f28a3ff6ac474106778db62f02e0249*/ "ID", "LC" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*3f28a3ff6ac474106778db62f02e0249*/ "ID", "LC" FROM  "TYPETEST1"
+(9 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1, typetest1  t2 WHERE t1.lc = t2.lc ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  3 |  3
+  4 |  4
+(3 rows)
+
+-- only one join condition cannot be pushed down
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 JOIN typetest1  t2 ON t1.vc = t2.vc AND t1.lb = t2.lb ORDER BY t1.id, t2.id;
+                                                    QUERY PLAN                                                    
+------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Join
+         Hash Cond: (((t1.vc)::text = (t2.vc)::text) AND (t1.lb = t2.lb))
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*d88d1055820a4360fb46aae8f97a08fe*/ "ID", "VC", "LB" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*d88d1055820a4360fb46aae8f97a08fe*/ "ID", "VC", "LB" FROM  "TYPETEST1"
+(9 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 JOIN typetest1  t2 ON t1.vc = t2.vc AND t1.lb = t2.lb ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  3 |  3
+  4 |  4
+(3 rows)
+
+-- condition on one table needs to be evaluated locally
+EXPLAIN (COSTS off)
+SELECT max(t1.id), min(t2.id) FROM typetest1  t1 JOIN typetest1  t2 ON t1.fl = t2.fl WHERE t1.vc || 'x' = 'shortx' ORDER BY 1, 2;
+                                                       QUERY PLAN                                                       
+------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: (max(t1.id)), (min(t2.id))
+   ->  Aggregate
+         ->  Hash Join
+               Hash Cond: (t2.fl = t1.fl)
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*b3d9f63b30c3dd47efef8c8a833a7967*/ "ID", "FL" FROM  "TYPETEST1"
+               ->  Hash
+                     ->  Foreign Scan on typetest1 t1
+                           Filter: (((vc)::text || 'x'::text) = 'shortx'::text)
+                           Oracle query: SELECT /*b7fe9db125037c9a5195abcafb159e43*/ "ID", "VC", "FL" FROM  "TYPETEST1"
+(11 rows)
+
+SELECT max(t1.id), min(t2.id) FROM typetest1  t1 JOIN typetest1  t2 ON t1.fl = t2.fl WHERE t1.vc || 'x' = 'shortx' ORDER BY 1, 2;
+ max | min 
+-----+-----
+   4 |   4
+(1 row)
+
+EXPLAIN (COSTS off)
+SELECT t1.c, t2.nc FROM typetest1  t1 JOIN (SELECT * FROM typetest1)  t2 ON (t1.id = t2.id AND t1.c >= t2.c) ORDER BY t1.id, t2.nc;
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, typetest1.nc
+   ->  Hash Join
+         Hash Cond: (t1.id = typetest1.id)
+         Join Filter: (t1.c >= typetest1.c)
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*2f41bf5bdbdf599d2c12e50f12a4239f*/ "ID", "C" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan on typetest1
+                     Oracle query: SELECT /*a95e0400571c5428cc470fb744cb0483*/ "ID", "C", "NC" FROM  "TYPETEST1"
+(10 rows)
+
+SELECT t1.c, t2.nc FROM typetest1  t1 JOIN (SELECT * FROM typetest1)  t2 ON (t1.id = t2.id AND t1.c >= t2.c) ORDER BY t1.id, t2.nc;
+          c           |          nc          
+----------------------+----------------------
+ fixed chau           | nat'l char
+ a\x1B\x07\r\x7Fb     | a\x1B\x07\r\x7Fb    
+ short                | short     
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.c, t2.nc FROM typetest1  t1 LEFT JOIN (SELECT * FROM typetest1)  t2 ON (t1.id = t2.id AND t1.c >= t2.c) ORDER BY t1.id, t2.nc;
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, typetest1.nc
+   ->  Hash Left Join
+         Hash Cond: (t1.id = typetest1.id)
+         Join Filter: (t1.c >= typetest1.c)
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*2f41bf5bdbdf599d2c12e50f12a4239f*/ "ID", "C" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan on typetest1
+                     Oracle query: SELECT /*a95e0400571c5428cc470fb744cb0483*/ "ID", "C", "NC" FROM  "TYPETEST1"
+(10 rows)
+
+SELECT t1.c, t2.nc FROM typetest1  t1 LEFT JOIN (SELECT * FROM typetest1)  t2 ON (t1.id = t2.id AND t1.c >= t2.c) ORDER BY t1.id, t2.nc;
+          c           |          nc          
+----------------------+----------------------
+ fixed chau           | nat'l char
+ a\x1B\x07\r\x7Fb     | a\x1B\x07\r\x7Fb    
+ short                | short     
+(3 rows)
+
+-- subquery with where clause cannnot be pushed down in full outer join query
+EXPLAIN (COSTS off)
+SELECT t1.c, t2.nc FROM typetest1  t1 FULL JOIN (SELECT * FROM typetest1  WHERE id > 1) t2 USING (id) ORDER BY t1.id, t2.nc;
+                                                         QUERY PLAN                                                          
+-----------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, typetest1.nc
+   ->  Hash Full Join
+         Hash Cond: (t1.id = typetest1.id)
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*2f41bf5bdbdf599d2c12e50f12a4239f*/ "ID", "C" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan on typetest1
+                     Oracle query: SELECT /*d8627faf80a677c26b5b09afca5891ae*/ "ID", "NC" FROM  "TYPETEST1" WHERE ("ID" > 1)
+(9 rows)
+
+SELECT t1.c, t2.nc FROM typetest1  t1 FULL JOIN (SELECT * FROM typetest1  WHERE id > 1) t2 USING (id) ORDER BY t1.id, t2.nc;
+          c           |          nc          
+----------------------+----------------------
+ fixed chau           | 
+ a\x1B\x07\r\x7Fb     | a\x1B\x07\r\x7Fb    
+ short                | short     
+(3 rows)
+
+-- left outer join with placeholder, not pushed down
+EXPLAIN (COSTS off)
+SELECT t1.id, sq1.x, sq1.y
+FROM typetest1  t1 LEFT OUTER JOIN (SELECT id AS x, 99 AS y FROM typetest1  t2 WHERE id > 1) sq1 ON t1.id = sq1.x ORDER BY t1.id, sq1.x;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Left Join
+         Hash Cond: (t1.id = t2.id)
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*f15219a2beec4f2ef86ad7a25d19ded2*/ "ID" FROM  "TYPETEST1" WHERE ("ID" > 1)
+(9 rows)
+
+SELECT t1.id, sq1.x, sq1.y
+FROM typetest1  t1 LEFT OUTER JOIN (SELECT id AS x, 99 AS y FROM typetest1  t2 WHERE id > 1) sq1 ON t1.id = sq1.x ORDER BY t1.id, sq1.x;
+ id | x | y  
+----+---+----
+  1 |   |   
+  3 | 3 | 99
+  4 | 4 | 99
+(3 rows)
+
+-- inner join with placeholder, not pushed down
+EXPLAIN (COSTS off)
+SELECT subq2.c3
+FROM typetest1
+RIGHT JOIN (SELECT c AS c1 FROM typetest1)  AS subq1 ON TRUE
+LEFT JOIN  (SELECT ref1.nc AS c2, 10 AS c3 FROM typetest1  AS ref1
+            INNER JOIN typetest1  AS ref2 ON ref1.fl = ref2.fl) AS subq2
+ON subq1.c1 = subq2.c2 ORDER BY subq2.c3;
+                                                                              QUERY PLAN                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: (10)
+   ->  Nested Loop Left Join
+         ->  Hash Left Join
+               Hash Cond: (typetest1_1.c = ref1.nc)
+               ->  Foreign Scan on typetest1 typetest1_1
+                     Oracle query: SELECT /*0e1dc3b0ae3c635cbf8d5176850f3d6a*/ "C" FROM  "TYPETEST1"
+               ->  Hash
+                     ->  Foreign Scan
+                           Oracle query: SELECT /*d4a1c09e036ab2ce7cd60ca74eb4468e*/ r7."NC" FROM ( "TYPETEST1" r7 INNER JOIN  "TYPETEST1" r8 ON (r7."FL" = r8."FL"))
+         ->  Materialize
+               ->  Foreign Scan on typetest1
+                     Oracle query: SELECT /*22fd97d9592c8ca50819ac107500711c*/ NULL FROM  "TYPETEST1"
+(13 rows)
+
+SELECT subq2.c3
+FROM typetest1
+RIGHT JOIN (SELECT c AS c1 FROM typetest1)  AS subq1 ON TRUE
+LEFT JOIN  (SELECT ref1.nc AS c2, 10 AS c3 FROM typetest1  AS ref1
+            INNER JOIN typetest1  AS ref2 ON ref1.fl = ref2.fl) AS subq2
+ON subq1.c1 = subq2.c2 ORDER BY subq2.c3;
+ c3 
+----
+ 10
+ 10
+ 10
+ 10
+ 10
+ 10
+   
+   
+   
+(9 rows)
+
+-- inner rel is false, not pushed down
+EXPLAIN (COSTS off)
+SELECT 1 FROM (SELECT 1 FROM typetest1  WHERE false) AS subq1 RIGHT JOIN typetest1  AS ref1 ON NULL ORDER BY ref1.id;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Nested Loop Left Join
+   Join Filter: NULL::boolean
+   ->  Foreign Scan on typetest1 ref1
+         Oracle query: SELECT /*8a8acf1852644ef7b9353a89130ba3b1*/ "ID" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+   ->  Result
+         One-Time Filter: false
+(6 rows)
+
+SELECT 1 FROM (SELECT 1 FROM typetest1  WHERE false) AS subq1 RIGHT JOIN typetest1  AS ref1 ON NULL ORDER BY ref1.id;
+ ?column? 
+----------
+        1
+        1
+        1
+(3 rows)
+
+-- semi-join, not pushed down
+EXPLAIN (COSTS off)
+SELECT t1.id FROM typetest1  t1 WHERE EXISTS (SELECT 1 FROM typetest1  t2 WHERE t1.d = t2.d) ORDER BY t1.id;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Semi Join
+   Join Filter: (t1.d = t2.d)
+   ->  Foreign Scan on typetest1 t1
+         Oracle query: SELECT /*753aa7882d30791043181e4846bf4807*/ "ID", "D" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t2
+               Oracle query: SELECT /*51be1d1df9215b717d5cc526aea456ef*/ "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id FROM typetest1  t1 WHERE EXISTS (SELECT 1 FROM typetest1  t2 WHERE t1.d = t2.d) ORDER BY t1.id;
+ id 
+----
+  1
+  3
+(2 rows)
+
+-- anti-join, not pushed down
+EXPLAIN (COSTS off)
+SELECT t1.id FROM typetest1  t1 WHERE NOT EXISTS (SELECT 1 FROM typetest1  t2 WHERE t1.d = t2.d) ORDER BY t1.id;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Anti Join
+   Join Filter: (t1.d = t2.d)
+   ->  Foreign Scan on typetest1 t1
+         Oracle query: SELECT /*753aa7882d30791043181e4846bf4807*/ "ID", "D" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t2
+               Oracle query: SELECT /*51be1d1df9215b717d5cc526aea456ef*/ "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id FROM typetest1  t1 WHERE NOT EXISTS (SELECT 1 FROM typetest1  t2 WHERE t1.d = t2.d) ORDER BY t1.id;
+ id 
+----
+  4
+(1 row)
+
+-- cross join, not pushed down
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 CROSS JOIN typetest1  t2 ORDER BY t1.id, t2.id;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Nested Loop
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+         ->  Materialize
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(8 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 CROSS JOIN typetest1  t2 ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  1 |  3
+  1 |  4
+  3 |  1
+  3 |  3
+  3 |  4
+  4 |  1
+  4 |  3
+  4 |  4
+(9 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON true ORDER BY t1.id, t2.id;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Nested Loop
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+         ->  Materialize
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(8 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON true ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  1 |  3
+  1 |  4
+  3 |  1
+  3 |  3
+  3 |  4
+  4 |  1
+  4 |  3
+  4 |  4
+(9 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON true ORDER BY t1.id, t2.id;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Nested Loop Left Join
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+         ->  Materialize
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(8 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON true ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  1 |  3
+  1 |  4
+  3 |  1
+  3 |  3
+  3 |  4
+  4 |  1
+  4 |  3
+  4 |  4
+(9 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON true ORDER BY t1.id, t2.id;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Nested Loop Left Join
+         ->  Foreign Scan on typetest1 t2
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+         ->  Materialize
+               ->  Foreign Scan on typetest1 t1
+                     Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(8 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON true ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  1 |  3
+  1 |  4
+  3 |  1
+  3 |  3
+  3 |  4
+  4 |  1
+  4 |  3
+  4 |  4
+(9 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON true ORDER BY t1.id, t2.id;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Merge Full Join
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+         ->  Materialize
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(8 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON true ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  1
+  1 |  3
+  1 |  4
+  3 |  1
+  3 |  3
+  3 |  4
+  4 |  1
+  4 |  3
+  4 |  4
+(9 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 CROSS JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ORDER BY t1.id, t2.id;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, typetest1.id
+   ->  Nested Loop
+         ->  Foreign Scan on typetest1
+               Oracle query: SELECT /*c366fc62f3e501f80630030803a72454*/ "ID" FROM  "TYPETEST1" WHERE ("VC" = 'short')
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 CROSS JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  4
+  3 |  4
+  4 |  4
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 INNER JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ON true ORDER BY t1.id, t2.id;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, typetest1.id
+   ->  Nested Loop
+         ->  Foreign Scan on typetest1
+               Oracle query: SELECT /*c366fc62f3e501f80630030803a72454*/ "ID" FROM  "TYPETEST1" WHERE ("VC" = 'short')
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 INNER JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ON true ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  4
+  3 |  4
+  4 |  4
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 LEFT  JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ON true ORDER BY t1.id, t2.id;
+                                                         QUERY PLAN                                                          
+-----------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, typetest1.id
+   ->  Nested Loop Left Join
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+         ->  Materialize
+               ->  Foreign Scan on typetest1
+                     Oracle query: SELECT /*c366fc62f3e501f80630030803a72454*/ "ID" FROM  "TYPETEST1" WHERE ("VC" = 'short')
+(8 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 LEFT  JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ON true ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  4
+  3 |  4
+  4 |  4
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 RIGHT JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ON true ORDER BY t1.id, t2.id;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, typetest1.id
+   ->  Nested Loop Left Join
+         ->  Foreign Scan on typetest1
+               Oracle query: SELECT /*c366fc62f3e501f80630030803a72454*/ "ID" FROM  "TYPETEST1" WHERE ("VC" = 'short')
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 RIGHT JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ON true ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  4
+  3 |  4
+  4 |  4
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id FROM typetest1  t1 FULL  JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ON true ORDER BY t1.id, t2.id;
+                                                         QUERY PLAN                                                          
+-----------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, typetest1.id
+   ->  Merge Full Join
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+         ->  Materialize
+               ->  Foreign Scan on typetest1
+                     Oracle query: SELECT /*c366fc62f3e501f80630030803a72454*/ "ID" FROM  "TYPETEST1" WHERE ("VC" = 'short')
+(8 rows)
+
+SELECT t1.id, t2.id FROM typetest1  t1 FULL  JOIN (SELECT * FROM typetest1  WHERE vc = 'short') t2 ON true ORDER BY t1.id, t2.id;
+ id | id 
+----+----
+  1 |  4
+  3 |  4
+  4 |  4
+(3 rows)
+
+-- update statement, not pushed down
+EXPLAIN (COSTS off) UPDATE typetest1 t1 SET c = NULL FROM typetest1 t2 WHERE t1.vc = t2.vc AND t2.num = 3.14159;
+                                                                                                            QUERY PLAN                                                                                                             
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on typetest1 t1
+   Oracle statement: UPDATE "TYPETEST1" SET "C" = :p3 WHERE "ID" = :k1
+   ->  Hash Join
+         Hash Cond: ((t1.vc)::text = (t2.vc)::text)
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*6d5e9364165778a7dde4f4cfca92eaae*/ "ID", "NC", "VC", "NVC", "LC", "R", "U", "LB", "LR", "B", "NUM", "FL", "DB", "D", "TS", "IDS", "IYM" FROM  "TYPETEST1" FOR UPDATE
+         ->  Hash
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*1c0230076d75455b2bba1cd75e3c9d85*/ "ID", "C", "NC", "VC", "NVC", "LC", "R", "U", "LB", "LR", "B", "NUM", "FL", "DB", "D", "TS", "IDS", "IYM" FROM  "TYPETEST1" WHERE ("NUM" = 3.14159)
+(9 rows)
+
+-- join with FOR UPDATE, not pushed down
+EXPLAIN (COSTS off) SELECT t1.id FROM typetest1 t1, typetest1 t2 WHERE t1.id = t2.id FOR UPDATE;
+                                                                                                      QUERY PLAN                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ LockRows
+   ->  Hash Join
+         Hash Cond: (t1.id = t2.id)
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*3b14d565d0f78ac291edeea448ff4fee*/ "ID", "C", "NC", "VC", "NVC", "LC", "R", "U", "LB", "LR", "B", "NUM", "FL", "DB", "D", "TS", "IDS", "IYM" FROM  "TYPETEST1" FOR UPDATE
+         ->  Hash
+               ->  Foreign Scan on typetest1 t2
+                     Oracle query: SELECT /*3b14d565d0f78ac291edeea448ff4fee*/ "ID", "C", "NC", "VC", "NVC", "LC", "R", "U", "LB", "LR", "B", "NUM", "FL", "DB", "D", "TS", "IDS", "IYM" FROM  "TYPETEST1" FOR UPDATE
+(8 rows)
+
+-- join in CTE
+WITH t (t1_id, t2_id) AS (SELECT t1.id, t2.id FROM typetest1  t1 JOIN typetest1  t2 ON t1.d = t2.d) SELECT t1_id, t2_id FROM t ORDER BY t1_id, t2_id;
+ t1_id | t2_id 
+-------+-------
+     1 |     1
+     3 |     3
+(2 rows)
+
+-- whole-row and system columns, not pushed down
+EXPLAIN (COSTS off)
+SELECT t1, t1.ctid FROM shorty t1 INNER JOIN longy t2 ON t1.id = t2.id ORDER BY t1.id;
+                                                         QUERY PLAN                                                          
+-----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop
+   Join Filter: (t1.id = t2.id)
+   ->  Foreign Scan on shorty t1
+         Oracle query: SELECT /*751b37da42bf5a1167b44235a0f765b9*/ "ID", "C" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on longy t2
+               Oracle query: SELECT /*8a8acf1852644ef7b9353a89130ba3b1*/ "ID" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+(7 rows)
+
+SELECT t1, t1.ctid FROM shorty t1 INNER JOIN longy t2 ON t1.id = t2.id ORDER BY t1.id;
+             t1             |      ctid      
+----------------------------+----------------
+ (1,"fixed chau")           | (4294967295,0)
+ (3,"a\x1B\x07\r\x7Fb    ") | (4294967295,0)
+ (4,"short     ")           | (4294967295,0)
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1, t1.ctid FROM shorty t1 LEFT  JOIN longy t2 ON t1.id = t2.id ORDER BY t1.id;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Left Join
+   Join Filter: (t1.id = t2.id)
+   ->  Foreign Scan on shorty t1
+         Oracle query: SELECT /*751b37da42bf5a1167b44235a0f765b9*/ "ID", "C" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on longy t2
+               Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1, t1.ctid FROM shorty t1 LEFT  JOIN longy t2 ON t1.id = t2.id ORDER BY t1.id;
+             t1             |      ctid      
+----------------------------+----------------
+ (1,"fixed chau")           | (4294967295,0)
+ (3,"a\x1B\x07\r\x7Fb    ") | (4294967295,0)
+ (4,"short     ")           | (4294967295,0)
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1, t1.ctid FROM shorty t1 RIGHT JOIN longy t2 ON t1.id = t2.id ORDER BY t1.id;
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id
+   ->  Hash Right Join
+         Hash Cond: (t1.id = t2.id)
+         ->  Foreign Scan on shorty t1
+               Oracle query: SELECT /*751b37da42bf5a1167b44235a0f765b9*/ "ID", "C" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+         ->  Hash
+               ->  Foreign Scan on longy t2
+                     Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(9 rows)
+
+SELECT t1, t1.ctid FROM shorty t1 RIGHT JOIN longy t2 ON t1.id = t2.id ORDER BY t1.id;
+             t1             |      ctid      
+----------------------------+----------------
+ (1,"fixed chau")           | (4294967295,0)
+ (3,"a\x1B\x07\r\x7Fb    ") | (4294967295,0)
+ (4,"short     ")           | (4294967295,0)
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1, t1.ctid FROM shorty t1 FULL  JOIN longy t2 ON t1.id = t2.id ORDER BY t1.id;
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id
+   ->  Hash Full Join
+         Hash Cond: (t1.id = t2.id)
+         ->  Foreign Scan on shorty t1
+               Oracle query: SELECT /*751b37da42bf5a1167b44235a0f765b9*/ "ID", "C" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+         ->  Hash
+               ->  Foreign Scan on longy t2
+                     Oracle query: SELECT /*7d371bfc274425dbc57623fa5dc24632*/ "ID" FROM  "TYPETEST1"
+(9 rows)
+
+SELECT t1, t1.ctid FROM shorty t1 FULL  JOIN longy t2 ON t1.id = t2.id ORDER BY t1.id;
+             t1             |      ctid      
+----------------------------+----------------
+ (1,"fixed chau")           | (4294967295,0)
+ (3,"a\x1B\x07\r\x7Fb    ") | (4294967295,0)
+ (4,"short     ")           | (4294967295,0)
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1, t1.ctid FROM shorty t1 CROSS JOIN longy t2 ORDER BY t1.id;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Foreign Scan on shorty t1
+         Oracle query: SELECT /*751b37da42bf5a1167b44235a0f765b9*/ "ID", "C" FROM  "TYPETEST1" ORDER BY "ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on longy t2
+               Oracle query: SELECT /*22fd97d9592c8ca50819ac107500711c*/ NULL FROM  "TYPETEST1"
+(6 rows)
+
+SELECT t1, t1.ctid FROM shorty t1 CROSS JOIN longy t2 ORDER BY t1.id;
+             t1             |      ctid      
+----------------------------+----------------
+ (1,"fixed chau")           | (4294967295,0)
+ (1,"fixed chau")           | (4294967295,0)
+ (1,"fixed chau")           | (4294967295,0)
+ (3,"a\x1B\x07\r\x7Fb    ") | (4294967295,0)
+ (3,"a\x1B\x07\r\x7Fb    ") | (4294967295,0)
+ (3,"a\x1B\x07\r\x7Fb    ") | (4294967295,0)
+ (4,"short     ")           | (4294967295,0)
+ (4,"short     ")           | (4294967295,0)
+ (4,"short     ")           | (4294967295,0)
+(9 rows)
+
+-- only part of a three-way join will be pushed down
+---- inner join three tables
+EXPLAIN (COSTS off)
+SELECT t1.id, t3.id FROM typetest1  t1 JOIN typetest1  t2 USING (nvc) JOIN typetest1  t3 ON t2.db = t3.db ORDER BY t1.id, t3.id;
+                                                                             QUERY PLAN                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t3.id
+   ->  Hash Join
+         Hash Cond: (t2.db = t3.db)
+         ->  Foreign Scan
+               Oracle query: SELECT /*edd13c80dd13a7c7f4ae562e4d04f4d2*/ r1."ID", r2."DB" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."NVC" = r2."NVC"))
+         ->  Hash
+               ->  Foreign Scan on typetest1 t3
+                     Oracle query: SELECT /*1d532999d7b24933b56389312c1d8938*/ "ID", "DB" FROM  "TYPETEST1"
+(9 rows)
+
+SELECT t1.id, t3.id FROM typetest1  t1 JOIN typetest1  t2 USING (nvc) JOIN typetest1  t3 ON t2.db = t3.db ORDER BY t1.id, t3.id;
+ id | id 
+----+----
+  1 |  1
+  3 |  3
+  4 |  4
+(3 rows)
+
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d INNER JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                            QUERY PLAN                                                                                                             
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop
+   Join Filter: (t1.d = t3.d)
+   ->  Foreign Scan
+         Oracle query: SELECT /*1c2d4ebacf0b7e82cee37e82b432162c*/ r1."ID", r1."D", r2."ID", r2."D" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d INNER JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+(2 rows)
+
+---- inner outer join + left outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d LEFT  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                        QUERY PLAN                                                                                                         
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Left Join
+   Join Filter: (t2.d = t3.d)
+   ->  Foreign Scan
+         Oracle query: SELECT /*3eb5b06cbe3cc0fc56bf8b48d2398d6c*/ r1."ID", r2."ID", r2."D" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d LEFT  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+(2 rows)
+
+---- inner outer join + right outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d RIGHT JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                               
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Left Join
+         Hash Cond: (t3.d = t2.d)
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan
+                     Oracle query: SELECT /*3eb5b06cbe3cc0fc56bf8b48d2398d6c*/ r1."ID", r2."ID", r2."D" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(9 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d RIGHT JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+    |    |  4
+(3 rows)
+
+---- inner outer join + full outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d FULL  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                               
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Full Join
+         Hash Cond: (t3.d = t2.d)
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan
+                     Oracle query: SELECT /*3eb5b06cbe3cc0fc56bf8b48d2398d6c*/ r1."ID", r2."ID", r2."D" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(9 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 INNER JOIN typetest1  t2 ON t1.d = t2.d FULL  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+    |    |  4
+(3 rows)
+
+---- left outer join three tables
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d LEFT  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                        QUERY PLAN                                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Left Join
+   Join Filter: (t2.d = t3.d)
+   ->  Foreign Scan
+         Oracle query: SELECT /*4beeb2b85e6406a1f626b942f0c5ffdb*/ r1."ID", r2."ID", r2."D" FROM ( "TYPETEST1" r1 LEFT JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d LEFT  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+  4 |    |   
+(3 rows)
+
+---- left outer join + inner outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d INNER JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                            QUERY PLAN                                                                                                             
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop
+   Join Filter: (t1.d = t3.d)
+   ->  Foreign Scan
+         Oracle query: SELECT /*1c2d4ebacf0b7e82cee37e82b432162c*/ r1."ID", r1."D", r2."ID", r2."D" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d INNER JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+(2 rows)
+
+---- left outer join + right outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d RIGHT JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                               
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Left Join
+         Hash Cond: (t3.d = t2.d)
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan
+                     Oracle query: SELECT /*3eb5b06cbe3cc0fc56bf8b48d2398d6c*/ r1."ID", r2."ID", r2."D" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(9 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d RIGHT JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+    |    |  4
+(3 rows)
+
+---- left outer join + full outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d FULL  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Full Join
+         Hash Cond: (t3.d = t2.d)
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan
+                     Oracle query: SELECT /*4beeb2b85e6406a1f626b942f0c5ffdb*/ r1."ID", r2."ID", r2."D" FROM ( "TYPETEST1" r1 LEFT JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(9 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 LEFT  JOIN typetest1  t2 ON t1.d = t2.d FULL  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+  4 |    |   
+    |    |  4
+(4 rows)
+
+---- right outer join three tables
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d RIGHT JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Left Join
+         Hash Cond: (t3.d = t2.d)
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan
+                     Oracle query: SELECT /*4ffa5ea380df23c6e69719f4c4f2f598*/ r2."ID", r2."D", r1."ID" FROM ( "TYPETEST1" r2 LEFT JOIN  "TYPETEST1" r1 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(9 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d RIGHT JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+    |    |  4
+(3 rows)
+
+---- right outer join + inner outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d INNER JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                        QUERY PLAN                                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop
+   Join Filter: (t2.d = t3.d)
+   ->  Foreign Scan
+         Oracle query: SELECT /*4ffa5ea380df23c6e69719f4c4f2f598*/ r2."ID", r2."D", r1."ID" FROM ( "TYPETEST1" r2 LEFT JOIN  "TYPETEST1" r1 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d INNER JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+(2 rows)
+
+---- right outer join + left outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d LEFT  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                        QUERY PLAN                                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Left Join
+   Join Filter: (t2.d = t3.d)
+   ->  Foreign Scan
+         Oracle query: SELECT /*4ffa5ea380df23c6e69719f4c4f2f598*/ r2."ID", r2."D", r1."ID" FROM ( "TYPETEST1" r2 LEFT JOIN  "TYPETEST1" r1 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d LEFT  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+    |  4 |   
+(3 rows)
+
+---- right outer join + full outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d FULL  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Full Join
+         Hash Cond: (t3.d = t2.d)
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan
+                     Oracle query: SELECT /*4ffa5ea380df23c6e69719f4c4f2f598*/ r2."ID", r2."D", r1."ID" FROM ( "TYPETEST1" r2 LEFT JOIN  "TYPETEST1" r1 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(9 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 RIGHT JOIN typetest1  t2 ON t1.d = t2.d FULL  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+    |  4 |   
+    |    |  4
+(4 rows)
+
+---- full outer join three tables
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d FULL  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Full Join
+         Hash Cond: (t3.d = t2.d)
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan
+                     Oracle query: SELECT /*8b0512d90bcfd0e908fa0da706c1c4af*/ r1."ID", r2."ID", r2."D" FROM ( "TYPETEST1" r1 FULL JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(9 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d FULL  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+  4 |    |   
+    |  4 |   
+    |    |  4
+(5 rows)
+
+---- full outer join + inner join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d INNER JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                        QUERY PLAN                                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop
+   Join Filter: (t2.d = t3.d)
+   ->  Foreign Scan
+         Oracle query: SELECT /*4ffa5ea380df23c6e69719f4c4f2f598*/ r2."ID", r2."D", r1."ID" FROM ( "TYPETEST1" r2 LEFT JOIN  "TYPETEST1" r1 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d INNER JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+(2 rows)
+
+---- full outer join + left outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d LEFT  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                        QUERY PLAN                                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop Left Join
+   Join Filter: (t2.d = t3.d)
+   ->  Foreign Scan
+         Oracle query: SELECT /*8b0512d90bcfd0e908fa0da706c1c4af*/ r1."ID", r2."ID", r2."D" FROM ( "TYPETEST1" r1 FULL JOIN  "TYPETEST1" r2 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+   ->  Materialize
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+(7 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d LEFT  JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+  4 |    |   
+    |  4 |   
+(4 rows)
+
+---- full outer join + right outer join
+EXPLAIN (COSTS off)
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d RIGHT JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+                                                                                                              QUERY PLAN                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, t2.id
+   ->  Hash Left Join
+         Hash Cond: (t3.d = t2.d)
+         ->  Foreign Scan on typetest1 t3
+               Oracle query: SELECT /*4795709b476f02e2e3cdc32aac3f642f*/ "ID", "D" FROM  "TYPETEST1"
+         ->  Hash
+               ->  Foreign Scan
+                     Oracle query: SELECT /*4ffa5ea380df23c6e69719f4c4f2f598*/ r2."ID", r2."D", r1."ID" FROM ( "TYPETEST1" r2 LEFT JOIN  "TYPETEST1" r1 ON (r1."D" = r2."D")) ORDER BY r1."ID" ASC NULLS LAST, r2."ID" ASC NULLS LAST
+(9 rows)
+
+SELECT t1.id, t2.id, t3.id FROM typetest1  t1 FULL  JOIN typetest1  t2 ON t1.d = t2.d RIGHT JOIN typetest1  t3 ON t2.d = t3.d ORDER BY t1.id, t2.id;
+ id | id | id 
+----+----+----
+  1 |  1 |  1
+  3 |  3 |  3
+    |    |  4
+(3 rows)
+
+-- join with LATERAL reference
+EXPLAIN (COSTS off)
+SELECT t1.id, sl.c FROM typetest1  t1, LATERAL (SELECT DISTINCT s.c FROM shorty s,   longy l WHERE s.id = l.id AND l.c = t1.c) sl ORDER BY t1.id, sl.c;
+                                                                                       QUERY PLAN                                                                                       
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: t1.id, s.c
+   ->  Nested Loop
+         ->  Foreign Scan on typetest1 t1
+               Oracle query: SELECT /*2f41bf5bdbdf599d2c12e50f12a4239f*/ "ID", "C" FROM  "TYPETEST1"
+         ->  Unique
+               ->  Sort
+                     Sort Key: s.c
+                     ->  Foreign Scan
+                           Oracle query: SELECT /*b8c0caf397e3c49e38e44aef66c45c26*/ r1."C" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."ID" = r2."ID") AND (r2."C" = :p1))
+(10 rows)
+
+SELECT t1.id, sl.c FROM typetest1  t1, LATERAL (SELECT DISTINCT s.c FROM shorty s,   longy l WHERE s.id = l.id AND l.c = t1.c) sl ORDER BY t1.id, sl.c;
+ id |          c           
+----+----------------------
+  1 | fixed chau
+  3 | a\x1B\x07\r\x7Fb    
+  4 | short     
+(3 rows)
+
+-- test for bug #279 fixed with 839b125e1bdc63b71220ccd675fa852c028de9ea
+SELECT 1
+FROM typetest1 a
+   LEFT JOIN typetest1 b ON (a.id IS NOT NULL)
+WHERE (a.c = a.vc) = (b.id IS NOT NULL);
+ ?column? 
+----------
+        1
+        1
+        1
+        1
+        1
+        1
+(6 rows)
+
+/*
+ * Cost estimates.
+ */
+-- gather statistics
+ANALYZE typetest1;
+-- costs with statistics
+EXPLAIN SELECT t1.id, t2.id FROM typetest1 t1, typetest1 t2 WHERE t1.c = t2.c;
+                                                                     QUERY PLAN                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan  (cost=10000.00..10030.00 rows=3 width=8)
+   Oracle query: SELECT /*0f93f3e5f4248184be9df64616ee30ae*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."C" = r2."C"))
+(2 rows)
+
+EXPLAIN SELECT t1.id, t2.id FROM typetest1 t1, typetest1 t2 WHERE t1.c <> t2.c;
+                                                                      QUERY PLAN                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan  (cost=10000.00..10060.00 rows=6 width=8)
+   Oracle query: SELECT /*302b1a41f2c86c5b6478655c95853ffa*/ r1."ID", r2."ID" FROM ( "TYPETEST1" r1 INNER JOIN  "TYPETEST1" r2 ON (r1."C" <> r2."C"))
+(2 rows)
+
+-- clean up
+DROP EXTENSION oracle_fdw CASCADE;
+NOTICE:  drop cascades to 5 other objects
