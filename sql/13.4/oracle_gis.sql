@@ -3,8 +3,15 @@
  */
 
 CREATE EXTENSION postgis;
+CREATE EXTENSION oracle_fdw;
+
+-- TWO_TASK or ORACLE_HOME and ORACLE_SID must be set in the server's environment for this to work
+CREATE SERVER oracle FOREIGN DATA WRAPPER oracle_fdw OPTIONS (dbserver '', isolation_level 'read_committed', nchar 'true');
+CREATE USER MAPPING FOR CURRENT_USER SERVER oracle OPTIONS (user 'SCOTT', password 'tiger');
+
 -- reconnect so that oracle_fdw recognizes PostGIS
 \c
+
 SET client_min_messages = WARNING;
 -- Table with a PostGIS geometry
 CREATE FOREIGN TABLE gis (
@@ -54,3 +61,7 @@ SELECT id, st_srid(g), st_astext(g) FROM gis ORDER BY id;
 WITH upd (id, srid, wkt) AS
    (UPDATE gis SET g=g RETURNING id, st_srid(g), st_astext(g))
 SELECT * FROM upd ORDER BY id;
+
+-- clean up
+DROP EXTENSION oracle_fdw CASCADE;
+DROP EXTENSION postgis CASCADE;

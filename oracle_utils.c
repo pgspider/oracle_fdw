@@ -61,6 +61,10 @@ static struct envEntry *envlist = NULL;
  */
 static ora_geometry null_geometry = { NULL, NULL, -1, NULL, -1, NULL };
 
+/* error handle for oracle api. It's not only used by oracle session.  */
+static OCIError *errhp = (OCIError *)NULL;
+
+
 /*
  * Helper functions
  */
@@ -92,7 +96,6 @@ oracleSession
 	const char *nls_lang, int have_nchar, const char *tablename, int curlevel)
 {
 	OCIEnv *envhp = NULL;
-	OCIError *errhp = NULL;
 	OCISvcCtx *svchp = NULL;
 	OCIServer *srvhp = NULL;
 	OCISession *userhp = NULL;
@@ -828,25 +831,14 @@ oracleIsStatementOpen(oracleSession *session)
 }
 
 /*
- * oracleDescribe
- * 		Find the remote Oracle table and describe it.
- * 		Returns a palloc'ed data structure with the results.
+ * oracleCreateTableName
+ * 		Return table name.
  */
-struct oraTable
-*oracleDescribe(oracleSession *session, char *dblink, char *schema, char *table, char *pgname, long max_long)
+char
+*oracleCreateTableName(char *dblink, char *schema,char *table)
 {
-	struct oraTable *reply;
-	OCIStmt *stmthp;
-	OCIParam *colp;
-	ub2 oraType, charsize, bin_size;
-	ub1 csfrm;
-	sb2 precision;
-	sb1 scale;
-	char *qtable, *qdblink = NULL, *qschema = NULL, *tablename, *query;
-	OraText *ident, *typname, *typschema;
-	char *type_name, *type_schema;
-	ub4 ncols, ident_size, typname_size, typschema_size;
-	int i, length;
+	char *qtable, *qdblink = NULL, *qschema = NULL, *tablename;
+	int length;
 
 	/* get a complete quoted table name */
 	qtable = copyOraText(table, strlen(table), 1);
@@ -880,11 +872,28 @@ struct oraTable
 	if (schema != NULL)
 		oracleFree(qschema);
 
-	/* construct a "SELECT * FROM ..." query to describe columns */
-	length += 14;
-	query = oracleAlloc(length + 1);
-	strcpy(query, "SELECT * FROM ");
-	strcat(query, tablename);
+	return tablename;
+}
+
+/*
+ * oracleDescribe
+ * 		Find the remote Oracle table and describe it.
+ * 		Returns a palloc'ed data structure with the results.
+ */
+struct oraTable
+*oracleDescribe(oracleSession *session, char *query, char *tablename, char *pgname, long max_long)
+{
+	struct oraTable *reply;
+	OCIStmt *stmthp;
+	OCIParam *colp;
+	ub2 oraType, charsize, bin_size;
+	ub1 csfrm;
+	sb2 precision;
+	sb1 scale;
+	OraText *ident, *typname, *typschema;
+	char *type_name, *type_schema;
+	ub4 ncols, ident_size, typname_size, typschema_size;
+	int i;
 
 	/* create statement handle */
 	allocHandle((void **)&stmthp, OCI_HTYPE_STMT, 0, session->envp->envhp, session->connp,
@@ -950,8 +959,8 @@ struct oraTable
 		reply->cols[i-1]->strip_zeros = 0;
 		reply->cols[i-1]->pkey = 0;
 		reply->cols[i-1]->val = NULL;
-		reply->cols[i-1]->val_len = 0;
-		reply->cols[i-1]->val_null = 1;
+		reply->cols[i-1]->val_len = NULL;
+		reply->cols[i-1]->val_null = NULL;
 
 		/* get the parameter descriptor for the column */
 		if (checkerr(
@@ -1748,8 +1757,8 @@ oraclePrepareQuery(oracleSession *session, const char *query, const struct oraTa
 				if (checkerr(
 					OCIDefineByPos(session->stmthp, &defnhp, session->envp->errhp, (ub4)++col_pos,
 						(dvoid *)oraTable->cols[i]->val, (sb4)oraTable->cols[i]->val_size,
-						type, (dvoid *)&oraTable->cols[i]->val_null,
-						(ub2 *)&oraTable->cols[i]->val_len, NULL, OCI_DEFAULT),
+						type, (dvoid *)oraTable->cols[i]->val_null,
+						(ub2 *)oraTable->cols[i]->val_len, NULL, OCI_DEFAULT),
 					(dvoid *)session->envp->errhp, OCI_HTYPE_ERROR) != OCI_SUCCESS)
 				{
 					oracleError_d(FDW_UNABLE_TO_CREATE_EXECUTION,
@@ -1799,7 +1808,7 @@ oraclePrepareQuery(oracleSession *session, const char *query, const struct oraTa
 					}
 
 					/* set the column's indicator to NOT NULL for a later convertTuple */
-					oraTable->cols[i]->val_null = 0;
+					memset(oraTable->cols[i]->val_null, 0, sizeof(short));
 				}
 			}
 			else
@@ -1998,8 +2007,12 @@ oracleExecuteQuery(oracleSession *session, const struct oraTable *oraTable, stru
 		/*
 		 * Use the expensive character conversion only if we are dealing with
 		 * "national character sets" on the Oracle side.
+		 *
+		 * For CLOB, the default charset form is used (SQLCS_IMPLICIT), so don't set
+		 * national character set (SQLCS_NCHAR) by OCI_ATTR_CHARSET_FORM.
 		 */
 		if (session->have_nchar
+			&& (value_type != SQLT_CLOB)
 			&& checkerr(
 				OCIAttrSet((void *)param->bindh, OCI_HTYPE_BIND, (void *)&nchar, 0,
 					OCI_ATTR_CHARSET_FORM, session->envp->errhp),
@@ -2119,7 +2132,7 @@ oracleExecuteQuery(oracleSession *session, const struct oraTable *oraTable, stru
 			 * Should not lose any data in all possible cases
 			 * since LONG and LONG RAW don't work with RETURNING anyway.
 			 */
-			oraTable->cols[param->colnum]->val_len = (unsigned short)oraTable->cols[param->colnum]->val_len4;
+			oraTable->cols[param->colnum]->val_len = oraTable->cols[param->colnum]->val_len4;
 
 			/* for geometry columns, we have to get the indicator */
 			if (oraTable->cols[param->colnum]->oratype == ORA_TYPE_GEOMETRY)
@@ -3190,16 +3203,36 @@ sb4
 bind_out_callback(void *octxp, OCIBind *bindp, ub4 iter, ub4 index, void **bufpp, ub4 **alenp, ub1 *piecep, void **indp, ub2 **rcodep)
 {
 	struct oraColumn *column = (struct oraColumn *)octxp;
+	static ub4 rows = 0;
+
+	if (index == 0)
+	{
+		/* get row count */
+		(void) OCIAttrGet((CONST dvoid *)bindp, OCI_HTYPE_BIND, (dvoid *)&rows,
+						(ub4 *) sizeof(ub4), OCI_ATTR_ROWS_RETURNED, errhp);
+
+		/* reallocate buffer for returned data */
+		if (rows > 1)
+		{
+			column->val = oracleRealloc(column->val, column->val_size * rows);
+			column->val_null = oracleRealloc(column->val_null, sizeof(short) * rows);
+			column->val_len4 = oracleRealloc(column->val_len4, sizeof(unsigned int) * rows);
+
+			memset(column->val, 0, column->val_size * rows);
+			memset(column->val_null, 1, sizeof(short) * rows);
+			memset(column->val_len4, 0, sizeof(unsigned int) * rows);
+		}
+	}
 
 	if (column->oratype == ORA_TYPE_BLOB || column->oratype == ORA_TYPE_CLOB || column->oratype == ORA_TYPE_BFILE)
 	{
 		/* for LOBs, data should be written to the LOB locator */
-		*bufpp = *((OCILobLocator **)column->val);
-		*indp = &(column->val_null);
+		*bufpp = *((OCILobLocator **)(column->val + (index * column->val_size)));
+		*indp = (column->val_null) + index;
 	}
 	else if (column->oratype == ORA_TYPE_GEOMETRY)
 	{
-		ora_geometry *geom = (ora_geometry *)column->val;
+		ora_geometry *geom = (ora_geometry *)(column->val + (index * column->val_size));
 
 		/* initialize pointers to NULL, memory will be allocated */
 		geom->geometry = NULL;
@@ -3211,11 +3244,12 @@ bind_out_callback(void *octxp, OCIBind *bindp, ub4 iter, ub4 index, void **bufpp
 	else
 	{
 		/* for other types, data should be written directly to the buffer */
-		*bufpp = column->val;
-		*indp = &(column->val_null);
+		*bufpp = (dvoid *)(column->val + (index * column->val_size));
+		*indp = (column->val_null) + index;
 	}
-	column->val_len4 = (unsigned int)column->val_size;
-	*alenp = &(column->val_len4);
+
+	memcpy(column->val_len4 + index, (unsigned int *) &column->val_size, sizeof(unsigned int));
+	*alenp = (unsigned int*) (column->val_len4 + index);
 	*rcodep = NULL;
 
 	if (*piecep == OCI_ONE_PIECE)
@@ -3246,8 +3280,9 @@ bind_in_callback(void *ictxp, OCIBind *bindp, ub4 iter, ub4 index, void **bufpp,
 	}
 	else
 	{
-		column->val_null = -1;
-		*indpp = &(column->val_null);
+		column->val_null = (short *) oracleAlloc(sizeof(short));
+		memset(column->val_null, -1, sizeof(short));
+		*indpp = (column->val_null);
 	}
 
 	return OCI_CONTINUE;

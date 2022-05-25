@@ -1,4 +1,4 @@
-This is a list of things that would be nice to have.
+This is a list of things that should be done.
 Help is welcome!
 
 - Set parameters like NLS_DATE_FORMAT *after* the Oracle connection has been
@@ -6,8 +6,3 @@ Help is welcome!
   our NLS settings.
 
 - Convert OCI prefetching to bulk fetches to improve performance for LOBs.
-
-- Add a sample Docker file to build a container with PostgreSQL and oracle_fdw.
-  This can also serve as a cookbook for installing the software.
-
-- Aggregate pushdown.

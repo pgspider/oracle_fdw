@@ -120,10 +120,11 @@ struct oraColumn
 	int pkey;                /* nonzero for primary keys, later set to the resjunk attribute number */
 	char *val;               /* buffer for Oracle to return results in (LOB locator for LOBs) */
 	long val_size;           /* allocated size in val */
-	unsigned short val_len;  /* actual length of val */
-	unsigned int val_len4;   /* actual length of val - for bind callbacks */
-	short val_null;          /* indicator for NULL value */
+	unsigned int *val_len;   /* actual length of val */
+	unsigned int *val_len4;  /* actual length of val - for bind callbacks */
+	short *val_null;         /* indicator for NULL value */
 	int varno;               /* range table index of this column's relation */
+	int node_type;		 	 /* type of node */
 };
 
 struct oraTable
@@ -206,7 +207,7 @@ extern void oracleCancel(void);
 extern void oracleEndTransaction(void *arg, int is_commit, int silent);
 extern void oracleEndSubtransaction(void *arg, int nest_level, int is_commit);
 extern int oracleIsStatementOpen(oracleSession *session);
-extern struct oraTable *oracleDescribe(oracleSession *session, char *dblink, char *schema, char *table, char *pgname, long max_long);
+extern struct oraTable *oracleDescribe(oracleSession *session, char *query, char *tablename, char *pgname, long max_long);
 extern void oracleExplain(oracleSession *session, const char *query, int *nrows, char ***plan);
 extern void oraclePrepareQuery(oracleSession *session, const char *query, const struct oraTable *oraTable, unsigned int prefetch);
 extern int oracleExecuteQuery(oracleSession *session, const struct oraTable *oraTable, struct paramDesc *paramList);
@@ -217,6 +218,7 @@ extern void oracleClientVersion(int *major, int *minor, int *update, int *patch,
 extern void oracleServerVersion(oracleSession *session, int *major, int *minor, int *update, int *patch, int *port_patch);
 extern void *oracleGetGeometryType(oracleSession *session);
 extern int oracleGetImportColumn(oracleSession *session, char *dblink, char *schema, char **tabname, char **colname, oraType *type, int *charlen, int *typeprec, int *typescale, int *nullable, int *key);
+extern char *oracleCreateTableName(char *dblink, char *schema,char *table);
 
 /*
  * functions defined in oracle_fdw.c
