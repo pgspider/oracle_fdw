@@ -27,15 +27,15 @@
 #define LOB_CHUNK_SIZE 8132
 
 /* emit no error messages when set, used for shutdown */
-static int silent = 0;
+static volatile int silent = 0;
 
 /* contains Oracle error messages, set by checkerr() */
 #define ERRBUFSIZE 500
-static char oraMessage[ERRBUFSIZE];
-static sb4 err_code;
+static __thread char oraMessage[ERRBUFSIZE];
+static __thread sb4 err_code;
 
 /* set to "1" as soon as OCIEnvCreate is called */
-static int oci_initialized = 0;
+static volatile int oci_initialized = 0;
 
 /*
  * Linked list for temporary Oracle handles and descriptors.

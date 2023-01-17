@@ -558,9 +558,9 @@ struct OracleFdwState {
  */
 enum FdwPathPrivateIndex
 {
-	/* has-final-sort flag (as an integer Value node) */
+	/* has-final-sort flag (as a Boolean node) */
 	FdwPathPrivateHasFinalSort,
-	/* has-limit flag (as an integer Value node) */
+	/* has-limit flag (as a Boolean	node) */
 	FdwPathPrivateHasLimit
 };
 
@@ -675,7 +675,7 @@ static void checkDataType(oraType oratype, int scale, Oid pgtype, const char *ta
 static char *deparseWhereConditions(struct OracleFdwState *fdwState, PlannerInfo *root, RelOptInfo *baserel, List **local_conds, List **remote_conds);
 static char *guessNlsLang(char *nls_lang);
 static oracleSession *oracleConnectServer(Name srvname);
-static List *serializePlanData(struct OracleFdwState *fdwState);
+static List *serializePlanData(struct OracleFdwState *fdwState, struct oraTable *oraTable);
 static Const *serializeString(const char *s);
 static Const *serializeLong(long i);
 static struct OracleFdwState *deserializePlanData(List *list);
@@ -715,9 +715,12 @@ static void initializeContext(struct OracleFdwState *fdwState,
 									 RelOptInfo *scanrel,
 									 deparse_expr_cxt *context);
 
-static Expr *find_em_expr_for_input_target(PlannerInfo *root,
-										   EquivalenceClass *ec,
-										   PathTarget *target);
+extern EquivalenceMember *find_em_for_rel(PlannerInfo *root,
+										  EquivalenceClass *ec,
+										  RelOptInfo *rel);
+static EquivalenceMember *find_em_for_rel_target(PlannerInfo *root,
+												 EquivalenceClass *ec,
+												 RelOptInfo *rel);
 
 static List *get_useful_pathkeys_for_relation(PlannerInfo *root,
 											  RelOptInfo *rel);
@@ -1690,23 +1693,24 @@ ForeignScan
 )
 {
 	struct OracleFdwState *fdwState = (struct OracleFdwState *)foreignrel->fdw_private;
-	List *fdw_private = NIL;
-	int i;
-	bool need_keys = false, for_update = false, has_trigger;
-	Relation rel;
-	Index scan_relid;  /* will be 0 for join relations */
-	List *local_exprs = NIL;
+	List	   *fdw_private = NIL;
+	int			i;
+	bool		need_keys = false, for_update = false, has_trigger;
+	Relation	rel;
+	Index		scan_relid;  /* will be 0 for join relations */
+	List	   *local_exprs = NIL;
 #if PG_VERSION_NUM >= 90500
-	List *fdw_scan_tlist = NIL;
+	List	   *fdw_scan_tlist = NIL;
 #endif  /* PG_VERSION_NUM */
-	List *remote_exprs = NIL;
+	List	   *remote_exprs = NIL;
 	StringInfoData sql;
-	bool has_final_sort = false;
-	bool has_limit = false;
-	ListCell *lc;
+	bool		has_final_sort = false;
+	bool		has_limit = false;
+	ListCell   *lc;
+	struct oraTable *new_oraTable = NULL;
 
 	elog(DEBUG1, "oracle_fdw: get foreign plan");
-	
+
 	/* Decide to execute function pushdown support in the target list. */
 	fdwState->is_tlist_func_pushdown = oracle_is_foreign_function_tlist(root, foreignrel, tlist);
 
@@ -1715,10 +1719,17 @@ ForeignScan
 	 */
 	if (best_path->fdw_private)
 	{
+#if (PG_VERSION_NUM >= 150000)
+		has_final_sort = boolVal(list_nth(best_path->fdw_private,
+										  FdwPathPrivateHasFinalSort));
+		has_limit = boolVal(list_nth(best_path->fdw_private,
+									 FdwPathPrivateHasLimit));
+#else
 		has_final_sort = intVal(list_nth(best_path->fdw_private,
 										 FdwPathPrivateHasFinalSort));
 		has_limit = intVal(list_nth(best_path->fdw_private,
 									FdwPathPrivateHasLimit));
+#endif
 	}
 
 #ifdef JOIN_API
@@ -1934,26 +1945,26 @@ ForeignScan
 										 GetCurrentTransactionNestLevel());
 
 	/*
-	* rebuild oraTable for the scanning table based on the remote query,
-	* don't use oraTable which was created at GetForeignRelSize()
-	* because it represents to the remote table.
-	*/
-	fdwState->oraTable = oracleDescribe(fdwState->session,
-													 fdwState->query,
-													 fdwState->oraTable->name,
-													 fdwState->oraTable->pgname,
-													 fdwState->max_long);
+	 * rebuild oraTable for the scanning table based on the remote query,
+	 * don't use oraTable which was created at GetForeignRelSize()
+	 * because it represents to the remote table.
+	 */
+	new_oraTable = oracleDescribe(fdwState->session,
+								  fdwState->query,
+								  fdwState->oraTable->name,
+								  fdwState->oraTable->pgname,
+								  fdwState->max_long);
 
-	/* 
+	/*
 	 * In case of function pushdown, join pushdown and aggregation pushdown,
 	 * node type of each item in the scan target list is not only T_Var,
 	 * so we need Update node type in such cases. We check node type to get
 	 * column option in getColumnDataByTupdesc.
 	 */
-	for (i=0; i < fdwState->oraTable->ncols; ++i)
+	for (i=0; i < new_oraTable->ncols; ++i)
 	{
 		/* default is T_Var */
-		fdwState->oraTable->cols[i]->node_type = T_Var;
+		new_oraTable->cols[i]->node_type = T_Var;
 
 		/* update node type */
 		if (fdw_scan_tlist != NIL)
@@ -1961,7 +1972,7 @@ ForeignScan
 			TargetEntry* tle = (TargetEntry*) list_nth(fdw_scan_tlist, i);
 			Expr *expr = (Expr *)tle->expr;
 
-			fdwState->oraTable->cols[i]->node_type = expr->type;
+			new_oraTable->cols[i]->node_type = expr->type;
 		}
 	}
 
@@ -1969,7 +1980,7 @@ ForeignScan
 	pfree(fdwState->session);
 	fdwState->session = NULL;
 
-	fdw_private = serializePlanData(fdwState);
+	fdw_private = serializePlanData(fdwState, new_oraTable);
 
 	/*
 	 * Create the ForeignScan node for the given relation.
@@ -2575,7 +2586,7 @@ oraclePlanForeignModify(PlannerInfo *root, ModifyTable *plan, Index resultRelati
 	elog(DEBUG1, "oracle_fdw: remote statement is: %s", fdwState->query);
 
 	/* return a serialized form of the plan state */
-	return serializePlanData(fdwState);
+	return serializePlanData(fdwState, fdwState->oraTable);
 }
 
 /*
@@ -3777,9 +3788,15 @@ oraclePlanDirectModify(PlannerInfo *root,
 	 */
 	fpinfo->query = sql.data;
 	elog(DEBUG1, "oracle_fdw: remote query is %s", sql.data);
-	fscan->fdw_private = list_make3(serializePlanData(fpinfo),
+	fscan->fdw_private = list_make3(serializePlanData(fpinfo, fpinfo->oraTable),
+#if (PG_VERSION_NUM >= 150000)
+									makeBoolean(retrieved_attrs != NIL),
+									makeBoolean(plan->canSetTag)
+#else
 									makeInteger(retrieved_attrs != NIL),
-									makeInteger(plan->canSetTag));
+									makeInteger(plan->canSetTag)
+#endif
+									);
 
 	/*
 	 * Update the foreign-join-related fields.
@@ -3815,8 +3832,13 @@ oracleBeginDirectModify(ForeignScanState *node, int eflags)
 
 	/* Get private info created by planner functions. */
 	dmstate = deserializePlanData(list_nth(fsplan->fdw_private, 0));
+#if (PG_VERSION_NUM >= 150000)
+	dmstate->has_returning = boolVal(list_nth(fsplan->fdw_private, 1));
+	dmstate->set_processed = boolVal(list_nth(fsplan->fdw_private, 2));
+#else
 	dmstate->has_returning = intVal(list_nth(fsplan->fdw_private, 1));
 	dmstate->set_processed = intVal(list_nth(fsplan->fdw_private, 2));
+#endif
 
 	/* Initialize state variable */
 	dmstate->rowcount = -1;	/* -1 means not set yet */
@@ -5061,6 +5083,18 @@ castNullAsType(StringInfoData *dest, Oid type)
 			break;
 		case FLOAT8OID:
 			appendStringInfo(dest, "CAST(NULL AS BINARY_DOUBLE)");
+			break;
+		case NUMERICOID:
+			appendStringInfo(dest, "CAST(NULL AS NUMBER)");
+			break;
+		case TIMESTAMPOID:
+			appendStringInfo(dest, "CAST(NULL AS TIMESTAMP)");
+			break;
+		case TIMESTAMPTZOID:
+			appendStringInfo(dest, "CAST(NULL AS TIMESTAMP WITH TIME ZONE)");
+			break;
+		case BYTEAOID:
+			appendStringInfo(dest, "utl_raw.cast_to_raw(\'\')");
 			break;
 		default:
 			appendStringInfo(dest, "NULL");
@@ -6880,7 +6914,7 @@ oracleConnectServer(Name srvname)
  */
 
 List
-*serializePlanData(struct OracleFdwState *fdwState)
+*serializePlanData(struct OracleFdwState *fdwState, struct oraTable *oraTable)
 {
 	List *result = NIL;
 	int i, len = 0;
@@ -6903,28 +6937,28 @@ List
 	/* Oracle prefetch count */
 	result = lappend(result, serializeInt((int)fdwState->prefetch));
 	/* Oracle table name */
-	result = lappend(result, serializeString(fdwState->oraTable->name));
+	result = lappend(result, serializeString(oraTable->name));
 	/* PostgreSQL table name */
-	result = lappend(result, serializeString(fdwState->oraTable->pgname));
+	result = lappend(result, serializeString(oraTable->pgname));
 	/* number of columns in Oracle table */
-	result = lappend(result, serializeInt(fdwState->oraTable->ncols));
+	result = lappend(result, serializeInt(oraTable->ncols));
 	/* number of columns in PostgreSQL table */
-	result = lappend(result, serializeInt(fdwState->oraTable->npgcols));
+	result = lappend(result, serializeInt(oraTable->npgcols));
 	/* column data */
-	for (i=0; i<fdwState->oraTable->ncols; ++i)
+	for (i = 0; i < oraTable->ncols; ++i)
 	{
-		result = lappend(result, serializeString(fdwState->oraTable->cols[i]->name));
-		result = lappend(result, serializeInt(fdwState->oraTable->cols[i]->oratype));
-		result = lappend(result, serializeInt(fdwState->oraTable->cols[i]->scale));
-		result = lappend(result, serializeString(fdwState->oraTable->cols[i]->pgname));
-		result = lappend(result, serializeInt(fdwState->oraTable->cols[i]->pgattnum));
-		result = lappend(result, serializeOid(fdwState->oraTable->cols[i]->pgtype));
-		result = lappend(result, serializeInt(fdwState->oraTable->cols[i]->pgtypmod));
-		result = lappend(result, serializeInt(fdwState->oraTable->cols[i]->used));
-		result = lappend(result, serializeInt(fdwState->oraTable->cols[i]->strip_zeros));
-		result = lappend(result, serializeInt(fdwState->oraTable->cols[i]->pkey));
-		result = lappend(result, serializeLong(fdwState->oraTable->cols[i]->val_size));
-		result = lappend(result, serializeInt(fdwState->oraTable->cols[i]->node_type));
+		result = lappend(result, serializeString(oraTable->cols[i]->name));
+		result = lappend(result, serializeInt(oraTable->cols[i]->oratype));
+		result = lappend(result, serializeInt(oraTable->cols[i]->scale));
+		result = lappend(result, serializeString(oraTable->cols[i]->pgname));
+		result = lappend(result, serializeInt(oraTable->cols[i]->pgattnum));
+		result = lappend(result, serializeOid(oraTable->cols[i]->pgtype));
+		result = lappend(result, serializeInt(oraTable->cols[i]->pgtypmod));
+		result = lappend(result, serializeInt(oraTable->cols[i]->used));
+		result = lappend(result, serializeInt(oraTable->cols[i]->strip_zeros));
+		result = lappend(result, serializeInt(oraTable->cols[i]->pkey));
+		result = lappend(result, serializeLong(oraTable->cols[i]->val_size));
+		result = lappend(result, serializeInt(oraTable->cols[i]->node_type));
 		/* don't serialize val, val_len, val_len4, val_null and varno */
 	}
 
@@ -7290,38 +7324,70 @@ deparseTimestamp(Datum datum, bool hasTimezone)
 char
 *deparseInterval(Datum datum)
 {
+#if (PG_VERSION_NUM >= 150000)
+	struct pg_itm tm;
+#else
 	struct pg_tm tm;
 	fsec_t fsec;
+#endif
 	StringInfoData s;
 	char *sign;
 
+#if (PG_VERSION_NUM >= 150000)
+	interval2itm(*DatumGetIntervalP(datum), &tm);
+#else
 	if (interval2tm(*DatumGetIntervalP(datum), &tm, &fsec) != 0)
 	{
 		elog(ERROR, "could not convert interval to tm");
 	}
+#endif
 
 	/* only translate intervals that can be translated to INTERVAL DAY TO SECOND */
 	if (tm.tm_year != 0 || tm.tm_mon != 0)
 		return NULL;
 
 	/* Oracle intervals have only one sign */
-	if (tm.tm_mday < 0 || tm.tm_hour < 0 || tm.tm_min < 0 || tm.tm_sec < 0 || fsec < 0)
+	if (tm.tm_mday < 0 || tm.tm_hour < 0 || tm.tm_min < 0 || tm.tm_sec < 0
+#if PG_VERSION_NUM < 150000
+		|| fsec < 0
+#endif
+	   )
 	{
 		sign = "-";
 		/* all signs must match */
-		if (tm.tm_mday > 0 || tm.tm_hour > 0 || tm.tm_min > 0 || tm.tm_sec > 0 || fsec > 0)
+		if (tm.tm_mday > 0 || tm.tm_hour > 0 || tm.tm_min > 0 || tm.tm_sec > 0
+#if PG_VERSION_NUM < 150000
+			|| fsec < 0
+#endif
+		   )
 			return NULL;
 		tm.tm_mday = -tm.tm_mday;
 		tm.tm_hour = -tm.tm_hour;
 		tm.tm_min = -tm.tm_min;
 		tm.tm_sec = -tm.tm_sec;
+#if (PG_VERSION_NUM >= 150000)
+		tm.tm_usec = -tm.tm_usec;
+#else
 		fsec = -fsec;
+#endif
 	}
 	else
 		sign = "";
 
 	initStringInfo(&s);
-	appendStringInfo(&s, "INTERVAL '%s%d %02d:%02d:%02d.%06d' DAY(9) TO SECOND(6)", sign, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, fsec);
+	appendStringInfo(&s, "INTERVAL '%s%d %02d:%02d:%02d.%06d' DAY(9) TO SECOND(6)", sign, tm.tm_mday,
+#if (PG_VERSION_NUM >= 150000)
+																						  (int)tm.tm_hour,
+#else
+																						  tm.tm_hour,
+#endif
+																						  tm.tm_min, tm.tm_sec, 
+#if (PG_VERSION_NUM >= 150000)
+																						  tm.tm_usec
+#else
+																						  fsec
+#endif
+					);
 
 	return s.data;
 }
@@ -7430,8 +7496,12 @@ setModifyParameters(struct paramDesc *paramList, TupleTableSlot *newslot, TupleT
 	Datum datum;
 	bool isnull;
 	int32 value_len;
+#if (PG_VERSION_NUM >= 150000)
+	struct pg_itm datetime_tm;
+#else
 	struct pg_tm datetime_tm;
 	fsec_t datetime_fsec;
+#endif
 	StringInfoData s;
 	Oid pgtype;
 
@@ -7480,13 +7550,23 @@ setModifyParameters(struct paramDesc *paramList, TupleTableSlot *newslot, TupleT
 					char sign = '+';
 
 					/* get the parts */
+#if (PG_VERSION_NUM >= 150000)
+					interval2itm(*DatumGetIntervalP(datum), &datetime_tm);
+#else
 					(void)interval2tm(*DatumGetIntervalP(datum), &datetime_tm, &datetime_fsec);
+#endif
 
 					switch (oraTable->cols[param->colnum]->oratype)
 					{
 						case ORA_TYPE_INTERVALY2M:
 							if (datetime_tm.tm_mday != 0 || datetime_tm.tm_hour != 0
-									|| datetime_tm.tm_min != 0 || datetime_tm.tm_sec != 0 || datetime_fsec != 0)
+									|| datetime_tm.tm_min != 0 || datetime_tm.tm_sec != 0
+#if (PG_VERSION_NUM >= 150000)
+									|| datetime_tm.tm_usec != 0
+#else
+									|| datetime_fsec != 0
+#endif
+							   )
 								ereport(ERROR,
 										(errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
 										errmsg("invalid value for Oracle INTERVAL YEAR TO MONTH"),
@@ -7514,10 +7594,22 @@ setModifyParameters(struct paramDesc *paramList, TupleTableSlot *newslot, TupleT
 										errmsg("invalid value for Oracle INTERVAL DAY TO SECOND"),
 										errdetail("Year and month must be zero for such an interval.")));
 							if (datetime_tm.tm_mday < 0 || datetime_tm.tm_hour < 0 || datetime_tm.tm_min < 0
-								|| datetime_tm.tm_sec < 0 || datetime_fsec < 0)
+								|| datetime_tm.tm_sec < 0
+#if (PG_VERSION_NUM >= 150000)
+								|| datetime_tm.tm_usec < 0
+#else
+								|| datetime_fsec < 0
+#endif
+							   )
 							{
 								if (datetime_tm.tm_mday > 0 || datetime_tm.tm_hour > 0 || datetime_tm.tm_min > 0
-									|| datetime_tm.tm_sec > 0 || datetime_fsec > 0)
+									|| datetime_tm.tm_sec > 0
+#if (PG_VERSION_NUM >= 150000)
+									|| datetime_tm.tm_usec > 0
+#else
+									|| datetime_fsec > 0
+#endif
+								   )
 									ereport(ERROR,
 											(errcode(ERRCODE_FDW_INVALID_ATTRIBUTE_VALUE),
 											errmsg("invalid value for Oracle INTERVAL DAY TO SECOND"),
@@ -7527,13 +7619,29 @@ setModifyParameters(struct paramDesc *paramList, TupleTableSlot *newslot, TupleT
 								datetime_tm.tm_hour = -datetime_tm.tm_hour;
 								datetime_tm.tm_min = -datetime_tm.tm_min;
 								datetime_tm.tm_sec = -datetime_tm.tm_sec;
+#if (PG_VERSION_NUM >= 150000)
+								datetime_tm.tm_usec = -datetime_tm.tm_usec;
+#else
 								datetime_fsec = -datetime_fsec;
+#endif
 							}
 
 							initStringInfo(&s);
 							appendStringInfo(&s, "%c%d %02d:%02d:%02d.%06d",
-									sign, datetime_tm.tm_mday, datetime_tm.tm_hour, datetime_tm.tm_min,
-									datetime_tm.tm_sec, (int32)datetime_fsec);
+									sign, datetime_tm.tm_mday,
+#if (PG_VERSION_NUM >= 150000)
+									(int)datetime_tm.tm_hour,
+#else
+									datetime_tm.tm_hour,
+#endif
+									datetime_tm.tm_min,
+									datetime_tm.tm_sec,
+#if (PG_VERSION_NUM >= 150000)
+									(int32)datetime_tm.tm_usec
+#else
+									(int32)datetime_fsec
+#endif
+									);
 							param->value = s.data;
 							break;
 						default:
@@ -8602,16 +8710,61 @@ initializeContext(struct OracleFdwState *fdwState,
 }
 
 /*
- * Find an equivalence class member expression to be computed as a sort column
- * in the given target.
+ * Given an EquivalenceClass and a foreign relation, find an EC member
+ * that can be used to sort the relation remotely according to a pathkey
+ * using this EC.
+ *
+ * If there is more than one suitable candidate, return an arbitrary
+ * one of them.  If there is none, return NULL.
+ *
+ * This checks that the EC member expression uses only Vars from the given
+ * rel and is shippable.  Caller must separately verify that the pathkey's
+ * ordering operator is shippable.
  */
-Expr *
-find_em_expr_for_input_target(PlannerInfo *root,
-							  EquivalenceClass *ec,
-							  PathTarget *target)
+EquivalenceMember *
+find_em_for_rel(PlannerInfo *root, EquivalenceClass *ec, RelOptInfo *rel)
 {
+	ListCell   *lc;
+
+	foreach(lc, ec->ec_members)
+	{
+		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
+
+		/*
+		 * Note we require !bms_is_empty, else we'd accept constant
+		 * expressions which are not suitable for the purpose.
+		 */
+		if (bms_is_subset(em->em_relids, rel->relids) &&
+			!bms_is_empty(em->em_relids))
+			return em;
+	}
+
+	return NULL;
+}
+
+/*
+ * Find an EquivalenceClass member that is to be computed as a sort column
+ * in the given rel's reltarget, and is shippable.
+ *
+ * If there is more than one suitable candidate, return an arbitrary
+ * one of them.  If there is none, return NULL.
+ *
+ * This checks that the EC member expression uses only Vars from the given
+ * rel and is shippable.  Caller must separately verify that the pathkey's
+ * ordering operator is shippable.
+ */
+EquivalenceMember *
+find_em_for_rel_target(PlannerInfo *root, EquivalenceClass *ec,
+					   RelOptInfo *rel)
+{
+	PathTarget *target = rel->reltarget;
+	struct OracleFdwState *fpinfo = (struct OracleFdwState *) rel->fdw_private;
+	deparse_expr_cxt context;
 	ListCell   *lc1;
 	int			i;
+
+	/* Initialize context */
+	initializeContext(fpinfo, root, rel, rel, &context);
 
 	i = 0;
 	foreach(lc1, target->exprs)
@@ -8652,15 +8805,18 @@ find_em_expr_for_input_target(PlannerInfo *root,
 			while (em_expr && IsA(em_expr, RelabelType))
 				em_expr = ((RelabelType *) em_expr)->arg;
 
-			if (equal(em_expr, expr))
-				return em->em_expr;
+			if (!equal(em_expr, expr))
+				continue;
+
+			/* Check that expression (including relabels!) is shippable */
+			if (deparseExpr(em->em_expr, &context))
+				return em;
 		}
 
 		i++;
 	}
 
-	elog(ERROR, "could not find pathkey item to sort");
-	return NULL;				/* keep compiler quiet */
+	return NULL;
 }
 
 /*
@@ -8846,9 +9002,7 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 			return;
 
 		/* Get the sort expression for the pathkey_ec */
-		sort_expr = find_em_expr_for_input_target(root,
-												  pathkey_ec,
-												  input_rel->reltarget);
+		sort_expr = find_em_for_rel_target(root, pathkey_ec, input_rel)->em_expr;
 
 		em_type = exprType((Node *)sort_expr);
 
@@ -8882,7 +9036,11 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Build the fdw_private list that will be used by oracleGetForeignPlan.
 	 * Items in the list must match order in enum FdwPathPrivateIndex.
 	 */
+#if (PG_VERSION_NUM >= 150000)
+	fdw_private = list_make2(makeBoolean(true), makeBoolean(false));
+#else
 	fdw_private = list_make2(makeInteger(true), makeInteger(false));
+#endif
 
 	/* Create foreign ordering path */
 	ordered_path = create_foreign_upper_path(root,
@@ -9104,8 +9262,13 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Build the fdw_private list that will be used by oracleGetForeignPlan.
 	 * Items in the list must match order in enum FdwPathPrivateIndex.
 	 */
+#if (PG_VERSION_NUM >= 150000)
+	fdw_private = list_make2(makeBoolean(has_final_sort),
+							 makeBoolean(extra->limit_needed));
+#else
 	fdw_private = list_make2(makeInteger(has_final_sort),
 							 makeInteger(extra->limit_needed));
+#endif
 
 	/*
 	 * Although ORDER BY and LIMIT are marked to be pushed down here,
@@ -9948,6 +10111,9 @@ oracleDeparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel
 	bool	   in_quote = false;
 	int	   index;
 	char	   *wherecopy, *p, md5[33], parname[10];
+#if PG_VERSION_NUM >= 150000
+	const char *errstr;
+#endif
 	StringInfoData result;
 	deparse_expr_cxt context;
 
@@ -10060,11 +10226,20 @@ oracleDeparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel
 	 * Calculate MD5 hash of the query string so far.
 	 * This is needed to find the query in Oracle's library cache for EXPLAIN.
 	 */
-	if (! pg_md5_hash(buf->data, strlen(buf->data), md5))
+	if (!pg_md5_hash(buf->data, strlen(buf->data), md5
+#if PG_VERSION_NUM >= 150000
+		, &errstr
+#endif
+		))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
-				errmsg("out of memory")));
+#if PG_VERSION_NUM >= 150000
+				errmsg("could not compute %s hash: %s", "MD5", errstr)
+#else
+				errmsg("out of memory")
+#endif
+				));
 	}
 
 	/* add comment with MD5 hash to query */
@@ -10594,6 +10769,15 @@ set_transmission_modes(void)
 								 PGC_USERSET, PGC_S_SESSION,
 								 GUC_ACTION_SAVE, true, 0, false);
 
+	/*
+	 * In addition force restrictive search_path, in case there are any
+	 * regproc or similar constants to be printed.
+	 */
+	(void) set_config_option("search_path", "pg_catalog",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+
+
 	return nestlevel;
 }
 
@@ -10829,6 +11013,55 @@ add_paths_with_pathkeys_for_rel(PlannerInfo *root, RelOptInfo *rel,
 
 	useful_pathkeys_list = get_useful_pathkeys_for_relation(root, rel);
 
+	/*
+	 * Before creating sorted paths, arrange for the passed-in EPQ path, if
+	 * any, to return columns needed by the parent ForeignScan node so that
+	 * they will propagate up through Sort nodes injected below, if necessary.
+	 */
+	if (epq_path != NULL && useful_pathkeys_list != NIL)
+	{
+		struct OracleFdwState *fpinfo = (struct OracleFdwState *) rel->fdw_private;
+		PathTarget *target = copy_pathtarget(epq_path->pathtarget);
+
+		/* Include columns required for evaluating PHVs in the tlist. */
+		add_new_columns_to_pathtarget(target,
+									  pull_var_clause((Node *) target->exprs,
+													  PVC_RECURSE_PLACEHOLDERS));
+
+		/* Include columns required for evaluating the local conditions. */
+		foreach(lc, fpinfo->local_conds)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			add_new_columns_to_pathtarget(target,
+										  pull_var_clause((Node *) rinfo->clause,
+														  PVC_RECURSE_PLACEHOLDERS));
+		}
+
+		/*
+		 * If we have added any new columns, adjust the tlist of the EPQ path.
+		 *
+		 * Note: the plan created using this path will only be used to execute
+		 * EPQ checks, where accuracy of the plan cost and width estimates
+		 * would not be important, so we do not do set_pathtarget_cost_width()
+		 * for the new pathtarget here.  See also postgresGetForeignPlan().
+		 */
+		if (list_length(target->exprs) > list_length(epq_path->pathtarget->exprs))
+		{
+			/* The EPQ path is a join path, so it is projection-capable. */
+			Assert(is_projection_capable_path(epq_path));
+
+			/*
+			 * Use create_projection_path() here, so as to avoid modifying it
+			 * in place.
+			 */
+			epq_path = (Path *) create_projection_path(root,
+													   rel,
+													   epq_path,
+													   target);
+		}
+	}
+
 	/* Create one path for each set of pathkeys we found above. */
 	foreach(lc, useful_pathkeys_list)
 	{
@@ -10915,6 +11148,7 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 		{
 			PathKey    *pathkey = (PathKey *) lfirst(lc);
 			EquivalenceClass *pathkey_ec = pathkey->pk_eclass;
+			EquivalenceMember *em;
 			Expr	   *em_expr = NULL;
 			Oid em_type;
 			bool can_pushdown;
@@ -10929,8 +11163,14 @@ get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 			 * deparseExpr would detect volatile expressions as well, but
 			 * checking ec_has_volatile here saves some cycles.
 			 */
-			can_pushdown = !pathkey_ec->ec_has_volatile
-					&& ((em_expr = find_em_expr_for_rel(pathkey_ec, rel)) != NULL);
+			em = find_em_for_rel(root, pathkey->pk_eclass, rel);
+			if (em != NULL)
+			{
+				can_pushdown = !pathkey_ec->ec_has_volatile
+								&& ((em_expr = em->em_expr));
+			}
+			else
+				can_pushdown = false;
 
 			if (can_pushdown)
 			{
@@ -10972,8 +11212,7 @@ oracleAppendOrderByClause(List *pathkeys, bool has_final_sort,
 {
 	ListCell   *lcell;
 	int			nestlevel;
-	char	   *delim = " ";
-	RelOptInfo *baserel = context->scanrel;
+	const char	   *delim = " ";
 	StringInfo	buf = context->buf;
 
 	/* Make sure any constants in the exprs are printed portably */
@@ -10983,6 +11222,7 @@ oracleAppendOrderByClause(List *pathkeys, bool has_final_sort,
 	foreach(lcell, pathkeys)
 	{
 		PathKey    *pathkey = lfirst(lcell);
+		EquivalenceMember *em;
 		Expr	   *em_expr;
 		char	   *sort_clause;
 
@@ -10992,14 +11232,24 @@ oracleAppendOrderByClause(List *pathkeys, bool has_final_sort,
 			 * By construction, context->foreignrel is the input relation to
 			 * the final sort.
 			 */
-			em_expr = find_em_expr_for_input_target(context->root,
-													pathkey->pk_eclass,
-													context->foreignrel->reltarget);
+			em = find_em_for_rel_target(context->root,
+										pathkey->pk_eclass,
+										context->foreignrel);
 		}
 		else
-			em_expr = find_em_expr_for_rel(pathkey->pk_eclass, baserel);
+			em = find_em_for_rel(context->root,
+								 pathkey->pk_eclass,
+								 context->scanrel);
 
-		Assert(em_expr != NULL);
+		/*
+		 * We don't expect any error here; it would mean that shippability
+		 * wasn't verified earlier.  For the same reason, we don't recheck
+		 * shippability of the sort operator.
+		 */
+		if (em == NULL)
+			elog(ERROR, "could not find pathkey item to sort");
+
+		em_expr = em->em_expr;
 
 		appendStringInfoString(buf, delim);
 		sort_clause = deparseExpr(em_expr, context);
@@ -11404,8 +11654,10 @@ oracleDeparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 	int			nestlevel;
 	bool		first;
 	RangeTblEntry *rte = planner_rt_fetch(rtindex, root);
-	ListCell   *lc,
-			   *lc2;
+	ListCell	*lc;
+#if PG_VERSION_NUM >= 140000
+	ListCell	*lc2;
+#endif
 	struct OracleFdwState *fpinfo = (struct OracleFdwState *) foreignrel->fdw_private;
 	int	    index = 0;
 

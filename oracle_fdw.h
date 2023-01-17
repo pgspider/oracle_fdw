@@ -13,6 +13,7 @@
 #include "postgres_ext.h"
 
 #include <sys/types.h>
+#include <pthread.h>
 
 /* oracle_fdw version */
 #define ORACLE_FDW_VERSION "2.5.0devel"

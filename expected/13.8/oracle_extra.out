@@ -1,0 +1,675 @@
+--Testcase 1:
+SET client_min_messages = WARNING;
+--Testcase 2:
+CREATE EXTENSION oracle_fdw;
+-- TWO_TASK or ORACLE_HOME and ORACLE_SID must be set in the server's environment for this to work
+--Testcase 3:
+CREATE SERVER oracle FOREIGN DATA WRAPPER oracle_fdw OPTIONS (dbserver '', isolation_level 'read_committed', nchar 'true');
+--Testcase 4:
+CREATE USER MAPPING FOR CURRENT_USER SERVER oracle OPTIONS (user 'SCOTT', password 'tiger');
+-- drop the Oracle tables if they exist
+DO
+$$BEGIN
+--Testcase 5:
+   SELECT oracle_execute('oracle', 'DROP TABLE scott.extra1 PURGE');
+EXCEPTION
+   WHEN OTHERS THEN
+      NULL;
+END;$$;
+--Testcase 6:
+SELECT oracle_execute(
+          'oracle',
+          E'CREATE TABLE scott.extra1 (\n'
+          '   id  NUMBER(5)\n'
+          '      CONSTRAINT extra1_pkey PRIMARY KEY,\n'
+          '   c   CHAR(10 CHAR),\n'
+          '   nc  NCHAR(10),\n'
+          '   vc  VARCHAR2(10 CHAR),\n'
+          '   nvc NVARCHAR2(10),\n'
+          '   lc  CLOB,\n'
+          '   r   RAW(10),\n'
+          '   u   RAW(16),\n'
+          '   lb  BLOB,\n'
+          '   lr  LONG RAW,\n'
+          '   b   NUMBER(1),\n'
+          '   num NUMBER(7,5),\n'
+          '   fl  BINARY_FLOAT,\n'
+          '   db  BINARY_DOUBLE,\n'
+          '   d   DATE,\n'
+          '   ts  TIMESTAMP WITH TIME ZONE,\n'
+          '   ids INTERVAL DAY TO SECOND,\n'
+          '   iym INTERVAL YEAR TO MONTH\n'
+          ') SEGMENT CREATION IMMEDIATE'
+       );
+ oracle_execute 
+----------------
+ 
+(1 row)
+
+-- create the foreign tables
+--Testcase 7:
+CREATE FOREIGN TABLE extra1 (
+   id  integer OPTIONS (key 'yes') NOT NULL,
+   c   character(10),
+   nc  character(10),
+   vc  character varying(10),
+   nvc character varying(10),
+   lc  text,
+   r   bytea,
+   u   uuid,
+   lb  bytea,
+   lr  bytea,
+   b   boolean,
+   num numeric(7,5),
+   fl  float,
+   db  double precision,
+   d   date,
+   ts  timestamp with time zone,
+   ids interval,
+   iym interval
+) SERVER oracle OPTIONS (table 'EXTRA1');
+--Testcase 8:
+CREATE FOREIGN TABLE extra2 (
+   id  integer OPTIONS (key 'yes') NOT NULL,
+   c   character(10),
+   nc  character(10),
+   vc  character varying(10),
+   nvc character varying(10)
+) SERVER oracle OPTIONS (table 'EXTRA1');
+--
+-- Test INSERT ... RETURNING with Large Object data (LOB).
+--
+--Testcase 9:
+INSERT INTO extra1 (id, lc) VALUES (11111, 'aaaaaaaa') RETURNING id, lc;
+  id   |    lc    
+-------+----------
+ 11111 | aaaaaaaa
+(1 row)
+
+ 
+--
+-- Test INSERT ... RETURNING whole row.
+--
+--Testcase 10:
+INSERT INTO extra2 (id, vc) VALUES (33333, 'cc') RETURNING extra2;
+    extra2     
+---------------
+ (33333,,,cc,)
+(1 row)
+
+--
+-- Test that trigger on remote table works as expected
+--
+--Testcase 11:
+INSERT INTO extra2 (id, vc) VALUES (22222, 'bb') RETURNING *;
+  id   | c | nc | vc | nvc 
+-------+---+----+----+-----
+ 22222 |   |    | bb | 
+(1 row)
+
+--Testcase 12:
+CREATE OR REPLACE FUNCTION F_BRTRIG() RETURNS trigger AS $$
+BEGIN
+    NEW.vc = NEW.vc || '_brtrig';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+--Testcase 13:
+CREATE TRIGGER extra2_br_insert BEFORE INSERT OR UPDATE
+    ON extra2 FOR EACH ROW EXECUTE PROCEDURE F_BRTRIG();
+--Testcase 14:
+UPDATE extra2 SET c = 'aa' WHERE id = 22222 RETURNING *;
+  id   |     c      | nc |    vc     | nvc 
+-------+------------+----+-----------+-----
+ 22222 | aa         |    | bb_brtrig | 
+(1 row)
+
+--
+-- Test data types which are not allowed in ORDER BY and GROUP BY clauses
+--
+-- Test ORDER BY and GROUP BY with TEXT data type
+--Testcase 15:
+EXPLAIN (COSTS OFF)
+SELECT id, lc FROM extra1 GROUP BY id, lc ORDER BY lc;
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Group
+   Group Key: lc, id
+   ->  Sort
+         Sort Key: lc, id
+         ->  Foreign Scan on extra1
+               Oracle query: SELECT /*4d3272980f673b3a76d784ff97043a6f*/ "ID", "LC" FROM  "EXTRA1"
+(6 rows)
+
+--Testcase 16:
+SELECT id, lc FROM extra1 GROUP BY id, lc ORDER BY lc;
+  id   |    lc    
+-------+----------
+ 11111 | aaaaaaaa
+ 22222 | 
+ 33333 | 
+(3 rows)
+
+-- Test ORDER BY and GROUP BY with BYTE data type
+--Testcase 17:
+EXPLAIN (COSTS OFF)
+SELECT id, r FROM extra1 GROUP BY id, r ORDER BY r;
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: r
+   ->  Foreign Scan
+         Oracle query: SELECT /*60bbe74a190ab438b5a5749207130316*/ "ID", "R" FROM  "EXTRA1" GROUP BY "R", "ID"
+(4 rows)
+
+--Testcase 18:
+SELECT id, r FROM extra1 GROUP BY id, r ORDER BY r;
+  id   | r 
+-------+---
+ 11111 | 
+ 33333 | 
+ 22222 | 
+(3 rows)
+
+--
+-- Test string comparison
+--
+--Testcase 19:
+INSERT INTO extra1 (id, lc) VALUES (11112, 'bbbbbbbb') RETURNING id, lc;
+  id   |    lc    
+-------+----------
+ 11112 | bbbbbbbb
+(1 row)
+
+--Testcase 20:
+INSERT INTO extra1 (id, lc) VALUES (11113, 'CCCCCCCC') RETURNING id, lc;
+  id   |    lc    
+-------+----------
+ 11113 | CCCCCCCC
+(1 row)
+
+-- Do not pushdown string comparison with CLOB
+--Testcase 21:
+EXPLAIN (COSTS OFF)
+SELECT lc FROM extra1 WHERE lc = 'aaaaaaaa';
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Foreign Scan on extra1
+   Filter: (lc = 'aaaaaaaa'::text)
+   Oracle query: SELECT /*c8f69fa0d3ef7d83b632c2efcb0d5b52*/ "LC" FROM  "EXTRA1"
+(3 rows)
+
+--Testcase 22:
+SELECT lc FROM extra1 WHERE lc = 'aaaaaaaa';
+    lc    
+----------
+ aaaaaaaa
+(1 row)
+
+--Testcase 23:
+EXPLAIN (COSTS OFF)
+SELECT lc FROM extra1 WHERE upper(lc) = 'CCCCCCCC';
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Foreign Scan on extra1
+   Filter: (upper(lc) = 'CCCCCCCC'::text)
+   Oracle query: SELECT /*c8f69fa0d3ef7d83b632c2efcb0d5b52*/ "LC" FROM  "EXTRA1"
+(3 rows)
+
+--Testcase 24:
+SELECT lc FROM extra1 WHERE upper(lc) = 'CCCCCCCC';
+    lc    
+----------
+ CCCCCCCC
+(1 row)
+
+--Testcase 25:
+EXPLAIN (COSTS OFF)
+SELECT lc FROM extra1 WHERE lc != 'aaaaaaaa';
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Foreign Scan on extra1
+   Filter: (lc <> 'aaaaaaaa'::text)
+   Oracle query: SELECT /*c8f69fa0d3ef7d83b632c2efcb0d5b52*/ "LC" FROM  "EXTRA1"
+(3 rows)
+
+--Testcase 26:
+SELECT lc FROM extra1 WHERE lc != 'aaaaaaaa';
+    lc    
+----------
+ bbbbbbbb
+ CCCCCCCC
+(2 rows)
+
+--Testcase 27:
+EXPLAIN (COSTS OFF)
+SELECT lc FROM extra1 WHERE upper(lc) != 'CCCCCCCC';
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Foreign Scan on extra1
+   Filter: (upper(lc) <> 'CCCCCCCC'::text)
+   Oracle query: SELECT /*c8f69fa0d3ef7d83b632c2efcb0d5b52*/ "LC" FROM  "EXTRA1"
+(3 rows)
+
+--Testcase 28:
+SELECT lc FROM extra1 WHERE upper(lc) != 'CCCCCCCC';
+    lc    
+----------
+ aaaaaaaa
+ bbbbbbbb
+(2 rows)
+
+-- Pushdown number comparison with CLOB
+--Testcase 29:
+EXPLAIN (COSTS OFF)
+SELECT lc FROM extra1 WHERE length(lc) > 1;
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Foreign Scan on extra1
+   Oracle query: SELECT /*74c7697653f37cf72af55aa853e12edd*/ "LC" FROM  "EXTRA1" WHERE (length("LC") > 1)
+(2 rows)
+
+--Testcase 30:
+SELECT lc FROM extra1 WHERE length(lc) > 1;
+    lc    
+----------
+ aaaaaaaa
+ bbbbbbbb
+ CCCCCCCC
+(3 rows)
+
+-- Pushdown string comparison with VARCHAR
+--Testcase 31:
+EXPLAIN (COSTS OFF)
+SELECT vc FROM extra1 WHERE vc = 'cc';
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Foreign Scan on extra1
+   Oracle query: SELECT /*6dac8e30dae8d7e2c9fa88c101b9b023*/ "VC" FROM  "EXTRA1" WHERE ("VC" = 'cc')
+(2 rows)
+
+--Testcase 32:
+SELECT vc FROM extra1 WHERE vc = 'cc';
+ vc 
+----
+ cc
+(1 row)
+
+-- Test aggregation function pushdown (variance)
+--Testcase 33:
+EXPLAIN (COSTS OFF)
+SELECT variance(id) FROM extra1;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*3a8e1d916a0a6d86d475ca01b5182fc5*/ variance("ID") FROM  "EXTRA1"
+(2 rows)
+
+--Testcase 34:
+SELECT variance(id) FROM extra1;
+  variance  
+------------
+ 98753457.7
+(1 row)
+
+--
+-- Init data for testing aggregate functions
+--
+DO
+$$BEGIN
+--Testcase 35:
+   SELECT oracle_execute('oracle', 'DROP TABLE scott.aggtest PURGE');
+EXCEPTION
+   WHEN OTHERS THEN
+      NULL;
+END;$$;
+--Testcase 36:
+SELECT oracle_execute(
+          'oracle',
+          E'CREATE TABLE scott.aggtest (\n'
+          '   a        NUMBER(5) PRIMARY KEY,\n'
+          '   b        BINARY_FLOAT\n'
+          ') SEGMENT CREATION IMMEDIATE'
+       );
+ oracle_execute 
+----------------
+ 
+(1 row)
+
+--Testcase 37:
+CREATE FOREIGN TABLE aggtest (
+  a       int2,
+  b       float4
+) SERVER oracle OPTIONS (table 'AGGTEST');
+--Testcase 38:
+INSERT INTO aggtest (a, b) VALUES (56, 7.8), (100, 99.097), (0, 0.09561), (42, 324.78);
+--
+-- Test built-in aggregate functions
+--
+-- select stddev_pop (builtin function, explain)
+--Testcase 39:
+EXPLAIN (COSTS OFF)
+SELECT stddev_pop(b) FROM aggtest;
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*aa98fd832b3043a5ffe5cbafb9661d56*/ stddev_pop("B") FROM  "AGGTEST"
+(2 rows)
+
+-- select stddev_pop (builtin function, result)
+--Testcase 40:
+SELECT stddev_pop(b) FROM aggtest;
+ stddev_pop 
+------------
+  131.10704
+(1 row)
+
+-- select stddev_samp (builtin function, explain)
+--Testcase 41:
+EXPLAIN (COSTS OFF)
+SELECT stddev_samp(b) FROM aggtest;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*91bd76fd72f2e749a47b7f3485ca0bc9*/ stddev_samp("B") FROM  "AGGTEST"
+(2 rows)
+
+-- select stddev_samp (builtin function, result)
+--Testcase 42:
+SELECT stddev_samp(b) FROM aggtest;
+ stddev_samp 
+-------------
+  151.389359
+(1 row)
+
+-- select var_pop (builtin function, explain)
+--Testcase 43:
+EXPLAIN (COSTS OFF)
+SELECT var_pop(b) FROM aggtest;
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*01629eac3532b5f52b20d7bc128cd8ca*/ var_pop("B") FROM  "AGGTEST"
+(2 rows)
+
+-- select var_pop (builtin function, result)
+--Testcase 44:
+SELECT var_pop(b) FROM aggtest;
+  var_pop   
+------------
+ 17189.0547
+(1 row)
+
+-- select var_samp (builtin function, explain)
+--Testcase 45:
+EXPLAIN (COSTS OFF)
+SELECT var_samp(b) FROM aggtest;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*0e76b1363c26871bd8d12ef223468f60*/ var_samp("B") FROM  "AGGTEST"
+(2 rows)
+
+-- select var_samp (builtin function, result)
+--Testcase 46:
+SELECT var_samp(b) FROM aggtest;
+  var_samp  
+------------
+ 22918.7383
+(1 row)
+
+-- select stddev_pop (not pushdown builtin function, explain)
+--Testcase 47:
+EXPLAIN (COSTS OFF)
+SELECT stddev_pop(b::numeric) FROM aggtest;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on aggtest
+         Oracle query: SELECT /*72bfcbeef7e866beb5baf26e3df32305*/ "B" FROM  "AGGTEST"
+(3 rows)
+
+-- select stddev_pop (not pushdown builtin function, result)
+--Testcase 48:
+SELECT stddev_pop(b::numeric) FROM aggtest;
+    stddev_pop    
+------------------
+ 131.107032862199
+(1 row)
+
+-- select stddev_samp (not pushdown builtin function, explain)
+--Testcase 49:
+EXPLAIN (COSTS OFF)
+SELECT stddev_samp(b::numeric) FROM aggtest;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on aggtest
+         Oracle query: SELECT /*72bfcbeef7e866beb5baf26e3df32305*/ "B" FROM  "AGGTEST"
+(3 rows)
+
+-- select stddev_samp (not pushdown builtin function, result)
+--Testcase 50:
+SELECT stddev_samp(b::numeric) FROM aggtest;
+   stddev_samp    
+------------------
+ 151.389361431288
+(1 row)
+
+-- select var_pop (not pushdown builtin function, explain)
+--Testcase 51:
+EXPLAIN (COSTS OFF)
+SELECT var_pop(b::numeric) FROM aggtest;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on aggtest
+         Oracle query: SELECT /*72bfcbeef7e866beb5baf26e3df32305*/ "B" FROM  "AGGTEST"
+(3 rows)
+
+-- select var_pop (not pushdown builtin function, result)
+--Testcase 52:
+SELECT var_pop(b::numeric) FROM aggtest;
+      var_pop       
+--------------------
+ 17189.054065929769
+(1 row)
+
+-- select var_samp (not pushdown builtin function, explain)
+--Testcase 53:
+EXPLAIN (COSTS OFF)
+SELECT var_samp(b::numeric) FROM aggtest;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on aggtest
+         Oracle query: SELECT /*72bfcbeef7e866beb5baf26e3df32305*/ "B" FROM  "AGGTEST"
+(3 rows)
+
+-- select var_samp (not pushdown builtin function, result)
+--Testcase 54:
+SELECT var_samp(b::numeric) FROM aggtest;
+      var_samp      
+--------------------
+ 22918.738754573025
+(1 row)
+
+-- select covar_pop (builtin function, explain)
+--Testcase 55:
+EXPLAIN (COSTS OFF)
+SELECT covar_pop(b, a), covar_samp(b, a) FROM aggtest;
+                                                      QUERY PLAN                                                       
+-----------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*621fc077c64177dd97cff41f46ef3b6a*/ covar_pop("B", "A"), covar_samp("B", "A") FROM  "AGGTEST"
+(2 rows)
+
+-- select covar_pop (builtin function, result)
+--Testcase 56:
+SELECT covar_pop(b, a), covar_samp(b, a) FROM aggtest;
+ covar_pop  | covar_samp 
+------------+------------
+ 653.628906 | 871.505188
+(1 row)
+
+-- select corr (builtin function, explain)
+--Testcase 57:
+EXPLAIN (COSTS OFF)
+SELECT corr(b, a) FROM aggtest;
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*56132db50b00840ec9961512b3563007*/ corr("B", "A") FROM  "AGGTEST"
+(2 rows)
+
+-- select corr (builtin function, result)
+--Testcase 58:
+SELECT corr(b, a) FROM aggtest;
+    corr    
+------------
+ 0.13963452
+(1 row)
+
+-- select percentile_cont (builtin function, explain)
+--Testcase 59:
+EXPLAIN (COSTS OFF)
+SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY b)) FROM aggtest;
+                                                                  QUERY PLAN                                                                   
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*760c80861918faf02d34e4df363f0254*/ percentile_cont(0.5) WITHIN GROUP (ORDER BY ("B") ASC NULLS LAST) FROM  "AGGTEST"
+(2 rows)
+
+-- select percentile_cont (builtin function, result)
+--Testcase 60:
+select (percentile_cont(0.5) WITHIN GROUP (ORDER BY b)) FROM aggtest;
+ percentile_cont 
+-----------------
+      53.4485016
+(1 row)
+
+-- select percentile_cont, sum (builtin function, explain)
+--Testcase 61:
+EXPLAIN (COSTS OFF)
+SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY b)), sum(b) FROM aggtest;
+                                                                       QUERY PLAN                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*d8ebae01f6c88730185defeff417803d*/ percentile_cont(0.5) WITHIN GROUP (ORDER BY ("B") ASC NULLS LAST), sum("B") FROM  "AGGTEST"
+(2 rows)
+
+-- select percentile_cont, sum (builtin function, result)
+--Testcase 62:
+SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY b)), sum(b) FROM aggtest;
+ percentile_cont |   sum    
+-----------------+----------
+      53.4485016 | 431.7726
+(1 row)
+
+-- select percentile_disc (builtin function, explain)
+--Testcase 63:
+EXPLAIN (COSTS OFF)
+SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY b)) FROM aggtest;
+                                                                 QUERY PLAN                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*cc6ce1332ca1c8170001788955d5d1b4*/ percentile_disc(0.5) WITHIN GROUP (ORDER BY "B" ASC NULLS LAST) FROM  "AGGTEST"
+(2 rows)
+
+-- select percentile_disc (builtin function, result)
+--Testcase 64:
+SELECT (percentile_disc(0.5) WITHIN GROUP (ORDER BY b)) FROM aggtest;
+ percentile_disc 
+-----------------
+             7.8
+(1 row)
+
+-- select percent_rank (builtin function, explain)
+--Testcase 65:
+EXPLAIN (COSTS OFF)
+SELECT (percent_rank(3) WITHIN GROUP (ORDER BY a)) FROM aggtest;
+                                                                QUERY PLAN                                                                
+------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*8f02b00054803dd5fbe7a3c636901c6c*/ percent_rank(3) WITHIN GROUP (ORDER BY ("A") ASC NULLS LAST) FROM  "AGGTEST"
+(2 rows)
+
+-- select percent_rank (builtin function, result)
+--Testcase 66:
+SELECT (percent_rank(3) WITHIN GROUP (ORDER BY a)) FROM aggtest;
+ percent_rank 
+--------------
+         0.25
+(1 row)
+
+-- select dense_rank (builtin function, explain)
+--Testcase 67:
+EXPLAIN (COSTS OFF)
+SELECT (dense_rank(3) WITHIN GROUP (ORDER BY a)) FROM aggtest;
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*6f97a29fe685a32ead47d2ac1fe7c9b6*/ dense_rank(3) WITHIN GROUP (ORDER BY ("A") ASC NULLS LAST) FROM  "AGGTEST"
+(2 rows)
+
+-- select dense_rank (builtin function, result)
+--Testcase 68:
+SELECT (dense_rank(3) WITHIN GROUP (ORDER BY a)) FROM aggtest;
+ dense_rank 
+------------
+          2
+(1 row)
+
+-- select dense_rank (builtin function, explain)
+--Testcase 69:
+EXPLAIN (COSTS OFF)
+SELECT (cume_dist(3) WITHIN GROUP (ORDER BY a)) FROM aggtest;
+                                                              QUERY PLAN                                                               
+---------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*32efe0aac450d368d3baeeaa6cddf5ef*/ cume_dist(3) WITHIN GROUP (ORDER BY ("A") ASC NULLS LAST) FROM  "AGGTEST"
+(2 rows)
+
+-- select dense_rank (builtin function, result)
+--Testcase 70:
+SELECT (cume_dist(3) WITHIN GROUP (ORDER BY a)) FROM aggtest;
+ cume_dist 
+-----------
+       0.4
+(1 row)
+
+--
+-- Test unique aggregate functions
+--
+-- select approx_count_distinct (unique function, explain)
+--Testcase 71:
+EXPLAIN (COSTS OFF)
+SELECT approx_count_distinct(b) FROM aggtest;
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Foreign Scan
+   Oracle query: SELECT /*2f7e0322fe4add2ee0b2ad4d3365dbe7*/ approx_count_distinct("B") FROM  "AGGTEST"
+(2 rows)
+
+-- select approx_count_distinct (unique function, result)
+--Testcase 72:
+SELECT approx_count_distinct(b) FROM aggtest;
+ approx_count_distinct 
+-----------------------
+                     4
+(1 row)
+
+-- Insert duplicate value of column b
+--Testcase 73:
+INSERT INTO aggtest (a, b) VALUES (57, 7.8);
+-- select approx_count_distinct (unique function, result)
+--Testcase 74:
+SELECT approx_count_distinct(b) FROM aggtest;
+ approx_count_distinct 
+-----------------------
+                     4
+(1 row)
+
+-- clean up
+--Testcase 75:
+DROP EXTENSION oracle_fdw CASCADE;

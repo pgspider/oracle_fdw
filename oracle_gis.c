@@ -81,12 +81,12 @@ typedef struct
 #define mapEntryValid(x) ((x)->from != 0)
 
 /* maps Oracle SRIDs to PostGIS SRIDs */
-static mapEntry *srid_map = NULL;
+static __thread mapEntry *srid_map = NULL;
 
 /* contains Oracle error messages, set by checkerr() */
 #define ERRBUFSIZE 500
-static char oraMessage[ERRBUFSIZE];
-static sb4 err_code;
+static __thread char oraMessage[ERRBUFSIZE];
+static __thread sb4 err_code;
 
 /*
  * Structures needed for managing the MDSYS.SDO_GEOMETRY Oracle type.

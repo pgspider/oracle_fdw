@@ -684,6 +684,17 @@ of PostgreSQL, but have different specificaiton in use.
 | oracle_localtimestamps   | localtimestamp                   |
 | oracle_extract           | extract                          |
 
+Oracle FDW does not support push down aggregate function group_id.
+
+Other features support
+-----------------------------
+- Support push-down LIMIT..OFFSET (by deparsing into FETCH FIRST N ROWS ONLY).
+- Support push-down FOR UPDATE (except with JOIN clause).
+- Support pushdown GROUP BY (var/expression)
+- Support pushdown GROUP BY + HAVING
+- Support pushdown ORDER BY (var/expression)
+- Support pushdown aggregates in subquery
+
 5 Installation Requirements
 ===========================
 
