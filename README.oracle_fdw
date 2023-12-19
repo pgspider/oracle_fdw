@@ -910,6 +910,11 @@ and a transaction manager, which is beyond what a foreign data wrapper
 can reasonably provide.  
 Prepared statements involving Oracle are not supported for the same reason.
 
+oracle_fdw enable thread safe mode of OCI library by default. With single-thread environment,
+it may incur performance hits. To disable thread safe mode please using build option:
+    $ make THREAD_SAFE=0
+
+
 8 Problems
 ==========
 
