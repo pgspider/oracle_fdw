@@ -172,7 +172,13 @@ oracleSession
 			handle_mode = OCI_OBJECT | OCI_NCHAR_LITERAL_REPLACE_ON;
 		else
 			handle_mode = OCI_OBJECT;
-
+#ifdef OCI_THREAD_SAFE
+		/*
+		 * Enable thread safety feature of OCI libraries,
+		 * it allows Oracle connection can be used in multithread environment.
+		 */
+		handle_mode = handle_mode | OCI_THREADED;
+#endif
 		/* create environment handle */
 		if (checkerr(
 			OCIEnvCreate((OCIEnv **) &envhp, handle_mode,

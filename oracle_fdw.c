@@ -53,6 +53,7 @@
 #if PG_VERSION_NUM >= 130000
 #include "optimizer/paths.h"
 #endif  /* PG_VERSION_NUM */
+#include "optimizer/inherit.h"
 #include "optimizer/planmain.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
@@ -73,6 +74,7 @@
 #include "utils/formatting.h"
 #include "utils/float.h"
 #include "utils/guc.h"
+#include "utils/varlena.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -338,6 +340,11 @@ typedef struct deparse_expr_cxt
 								 * which can pushed down to remote server */
 	bool handle_aggref;			/* mark if handling aggregation */
 } deparse_expr_cxt;
+
+typedef struct oracle_default_const_ctx
+{
+	Const *c;
+} oracle_default_const_ctx;
 
 #define OPT_NLS_LANG "nls_lang"
 #define OPT_DBSERVER "dbserver"
@@ -668,7 +675,7 @@ static void getColumnDataByTupdesc(Relation rel, TupleDesc tupdesc, List *retrie
 static int acquireSampleRowsFunc (Relation relation, int elevel, HeapTuple *rows, int targrows, double *totalrows, double *totaldeadrows);
 static void appendAsType(StringInfoData *dest, const char *s, Oid type);
 static void castNullAsType(StringInfoData *dest, Oid type);
-static char *deparseExpr(Expr *expr, deparse_expr_cxt *context);
+static char *deparseExpr(Expr *node, deparse_expr_cxt *context);
 static char *datumToString(Datum datum, Oid type);
 static void getUsedColumns(Expr *expr, struct oraTable *oraTable, int foreignrelid);
 static void checkDataType(oraType oratype, int scale, Oid pgtype, const char *tablename, const char *colname);
@@ -900,6 +907,21 @@ static void prepare_query_params(struct OracleFdwState *fdw_state,
 static void execute_dml_stmt(ForeignScanState *node);
 static TupleTableSlot *get_returning_data(ForeignScanState *node);
 
+extern int	
+#if (PG_VERSION_NUM >=160000)
+PGDLLEXPORT
+#endif
+ExecForeignDDL(Oid serverOid,
+			   Relation rel,
+			   int operation,
+			   bool exists_flag);
+static void oracleDeparseCreateTableSql(StringInfo buf, Relation rel, ForeignTable *foreigntable);
+static void oracleDeparseDropTableSql(StringInfo buf, Relation rel);
+static void oracleDeparseRelation(StringInfo buf, Relation rel);
+static char *oracleDeparseTypeName(Oid type_oid, int32 typemod);
+static char *oraclePrintTypmod(const char *typname, int32 typmod, Oid typmodout);
+static bool oracle_get_default_const_walker(Node *node, oracle_default_const_ctx * ctx);
+
 #define REL_ALIAS_PREFIX    "r"
 /* Handy macro to add relation name qualification */
 #define ADD_REL_QUALIFIER(buf, varno)   \
@@ -999,6 +1021,7 @@ oracle_fdw_validator(PG_FUNCTION_ARGS)
 		/* option not found, generate error message */
 		if (!opt_found)
 		{
+#if PG_VERSION_NUM < 160000
 			/* generate list of options */
 			StringInfoData buf;
 			initStringInfo(&buf);
@@ -1012,6 +1035,34 @@ oracle_fdw_validator(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					errmsg("invalid option \"%s\"", def->defname),
 					errhint("Valid options in this context are: %s", buf.data)));
+#else
+			/*
+			 * Unknown option specified, complain about it. Provide a hint
+			 * with a valid option that looks similar, if there is one.
+			 */
+			const char *closest_match;
+			ClosestMatchState match_state;
+			bool		has_valid_options = false;
+
+			initClosestMatch(&match_state, def->defname, 4);
+			for (i=0; i<option_count; ++i)
+			{
+				if (catalog == valid_options[i].optcontext)
+				{
+					has_valid_options = true;
+					updateClosestMatch(&match_state, valid_options[i].optname);
+				}
+			}
+
+			closest_match = getClosestMatch(&match_state);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("invalid option \"%s\"", def->defname),
+					 has_valid_options ? closest_match ?
+					 errhint("Perhaps you meant the option \"%s\".",
+					 		closest_match) : 0 :
+					 errhint("There are no valid options in this context.")));
+#endif
 		}
 
 		/* check valid values for "isolation_level" */
@@ -1268,7 +1319,12 @@ oracleGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntable
 	struct OracleFdwState *fdwState;
 	int i, major, minor, update, patch, port_patch;
 	double ntuples = -1;
+#if PG_VERSION_NUM < 160000
 	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
+	Oid			userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+	Oid			userid = OidIsValid(baserel->userid) ? baserel->userid : GetUserId();
+#endif
 	ListCell *lc;
 
 	elog(DEBUG1, "oracle_fdw: plan foreign table scan");
@@ -1278,7 +1334,7 @@ oracleGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntable
 	 * To match what ExecCheckRTEPerms does, pass the user whose user mapping
 	 * should be used (if invalid, the current user is used).
 	 */
-	fdwState = getFdwState(foreigntableid, NULL, rte->checkAsUser);
+	fdwState = getFdwState(foreigntableid, NULL, userid);
 
 	/*
 	 * Store the table OID in each table column.
@@ -1887,8 +1943,6 @@ ForeignScan
 		 */
 		if (outer_plan)
 		{
-			ListCell   *lc;
-
 			/*
 			 * Right now, we only consider grouping and aggregation beyond
 			 * joins. Queries involving aggregates or grouping do not require
@@ -2379,8 +2433,7 @@ oraclePlanForeignModify(PlannerInfo *root, ModifyTable *plan, Index resultRelati
 	bool has_trigger = false, firstcol;
 	char paramName[10];
 	TupleDesc tupdesc;
-	Bitmapset *tmpset;
-	AttrNumber col;
+	Oid userid = InvalidOid;
 
 #if PG_VERSION_NUM >= 90500
 	/* we don't support INSERT ... ON CONFLICT */
@@ -2390,12 +2443,26 @@ oraclePlanForeignModify(PlannerInfo *root, ModifyTable *plan, Index resultRelati
 				errmsg("INSERT with ON CONFLICT clause is not supported")));
 #endif  /* PG_VERSION_NUM */
 
+#if PG_VERSION_NUM < 160000
+	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+	if (rte->perminfoindex != 0)
+	{
+		RTEPermissionInfo *perminfo = getRTEPermissionInfo(root->parse->rteperminfos, rte);
+
+		userid = (perminfo != NULL && OidIsValid(perminfo->checkAsUser))? perminfo->checkAsUser : GetUserId();
+	}
+	else
+		userid = GetUserId();
+
+#endif
+
 	/*
 	 * We have to construct the foreign table data ourselves.
 	 * To match what ExecCheckRTEPerms does, pass the user whose user mapping
 	 * should be used (if invalid, the current user is used).
 	 */
-	fdwState = getFdwState(rte->relid, NULL, rte->checkAsUser);
+	fdwState = getFdwState(rte->relid, NULL, userid);
 
 	initStringInfo(&sql);
 
@@ -2433,20 +2500,35 @@ oraclePlanForeignModify(PlannerInfo *root, ModifyTable *plan, Index resultRelati
 	}
 	else if (operation == CMD_UPDATE)
 	{
-#if PG_VERSION_NUM >= 120000
-		tmpset = bms_union(rte->updatedCols, rte->extraUpdatedCols);
-#elif PG_VERSION_NUM >= 90500
-		tmpset = bms_copy(rte->updatedCols);
-#else
-		tmpset = bms_copy(rte->modifiedCols);
-#endif /* PG_VERSION_NUM */
+		Bitmapset  *allUpdatedCols;
+		AttrNumber	col;
+#if (PG_VERSION_NUM >= 130010 && PG_VERSION_NUM < 140000) || \
+	(PG_VERSION_NUM >= 140007 && PG_VERSION_NUM < 150000) || \
+	(PG_VERSION_NUM >= 150002 && PG_VERSION_NUM < 160000) || \
+	(PG_VERSION_NUM >= 160000)
+		RelOptInfo *relopt = find_base_rel(root, resultRelation);
 
-		while ((col = bms_first_member(tmpset)) >= 0)
+		/* get_rel_all_updated_cols is supported from pg 13.10, 14.7, 15.2 and 16 */
+		allUpdatedCols = get_rel_all_updated_cols(root, relopt);
+		col = -1;
+		while ((col = bms_next_member(allUpdatedCols, col)) >= 0)
+#elif PG_VERSION_NUM >= 120000
+		allUpdatedCols = bms_union(rte->updatedCols, rte->extraUpdatedCols);
+		while ((col = bms_first_member(allUpdatedCols)) >= 0)
+#elif PG_VERSION_NUM >= 90500
+		allUpdatedCols = bms_copy(rte->updatedCols);
+		while ((col = bms_first_member(allUpdatedCols)) >= 0)
+#else
+		allUpdatedCols = bms_copy(rte->modifiedCols);
+		while ((col = bms_first_member(allUpdatedCols)) >= 0)
+#endif
 		{
-			col += FirstLowInvalidHeapAttributeNumber;
-			if (col <= InvalidAttrNumber) /* shouldn't happen */
+			/* bit numbers are offset by FirstLowInvalidHeapAttributeNumber */
+			AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+
+			if (attno <= InvalidAttrNumber)	/* shouldn't happen */
 				elog(ERROR, "system-column update is not supported");
-			targetAttrs = lappend_int(targetAttrs, col);
+			targetAttrs = lappend_int(targetAttrs, attno);
 		}
 
 		/* is there a row level AFTER trigger? */
@@ -2680,6 +2762,7 @@ void oracleBeginForeignInsert(ModifyTableState *mtstate, ResultRelInfo *rinfo)
 	struct paramDesc *param;
 	HeapTuple tuple;
 	int i;
+	Oid userid = InvalidOid;
 
 	elog(DEBUG3, "oracle_fdw: execute foreign table COPY on %d", RelationGetRelid(rinfo->ri_RelationDesc));
 
@@ -2753,11 +2836,20 @@ void oracleBeginForeignInsert(ModifyTableState *mtstate, ResultRelInfo *rinfo)
 #endif  /* PG_VERSION_NUM */
 	}
 
+#if PG_VERSION_NUM < 160000
+	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+	/*
+	 * Simply using current user for get connection
+	 */
+	userid = GetUserId();
+#endif
+
 	/*
 	 * To match what ExecCheckRTEPerms does, pass the user whose user mapping
 	 * should be used (if invalid, the current user is used).
 	 */
-	fdw_state = getFdwState(RelationGetRelid(rinfo->ri_RelationDesc), NULL, rte->checkAsUser);
+	fdw_state = getFdwState(RelationGetRelid(rinfo->ri_RelationDesc), NULL, userid);
 
 	/* not using "deserializePlanData", we have to initialize these ourselves */
 	for (i=0; i<fdw_state->oraTable->ncols; ++i)
@@ -3523,6 +3615,7 @@ oraclePlanDirectModify(PlannerInfo *root,
 	List	   *returningList = NIL;
 	List	   *retrieved_attrs = NIL;
 	int	i;
+	Oid userid = InvalidOid;
 
 	elog(DEBUG1, "oracle_fdw: plan direct modify");
 
@@ -3579,8 +3672,17 @@ oraclePlanDirectModify(PlannerInfo *root,
 		foreignrel = root->simple_rel_array[resultRelation];
 	rte = root->simple_rte_array[resultRelation];
 
+#if PG_VERSION_NUM < 160000
+	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+#else
+	/*
+	 * Simply using current user for get connection
+	 */
+	userid = GetUserId();
+#endif
+
 	/* Need to refactor this part, need oraTable only */
-	fdwState = getFdwState(rte->relid, NULL, rte->checkAsUser);
+	fdwState = getFdwState(rte->relid, NULL, userid);
 	fpinfo = (struct OracleFdwState *) foreignrel->fdw_private;
 	fpinfo->oraTable = fdwState->oraTable;
 
@@ -4618,12 +4720,16 @@ foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
 		 * Currently, the core code doesn't wrap havingQuals in
 		 * RestrictInfos, so we must make our own.
 		 */
+
 		Assert(!IsA(expr, RestrictInfo));
 		rinfo = make_restrictinfo(root,
 								  expr,
 								  true,
 								  false,
 								  false,
+#if PG_VERSION_NUM >= 160000
+								  false,
+#endif
 								  root->qual_security_level,
 								  joinrel->relids,
 								  NULL,
@@ -5120,7 +5226,7 @@ castNullAsType(StringInfoData *dest, Oid type)
  * 		will be stored in "params".
  */
 char *
-deparseExpr(Expr *expr, deparse_expr_cxt *context)
+deparseExpr(Expr *node, deparse_expr_cxt *context)
 {
 	char *opername, *left, *right, *arg, oprkind;
 	char parname[10];
@@ -5161,13 +5267,13 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 	char *origin_function;
 
 	/* Need do nothing for empty subexpressions */
-	if (expr == NULL)
+	if (node == NULL)
 		return "do nothing";
 
-	switch(expr->type)
+	switch(node->type)
 	{
 		case T_Const:
-			constant = (Const *)expr;
+			constant = (Const *)node;
 			if (constant->constisnull)
 			{
 				/* only translate NULLs of a type Oracle can handle */
@@ -5198,7 +5304,7 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 			}
 			break;
 		case T_Param:
-			param = (Param *)expr;
+			param = (Param *)node;
 
 			/* don't try to handle interval parameters */
 			if (! canHandleType(param->paramtype) || param->paramtype == INTERVALOID)
@@ -5242,7 +5348,7 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 
 			break;
 		case T_Var:
-			variable = (Var *)expr;
+			variable = (Var *)node;
 			var_table = NULL;
 
 			/* check if the variable belongs to one of our foreign tables */
@@ -5392,7 +5498,7 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 
 			break;
 		case T_OpExpr:
-			oper = (OpExpr *)expr;
+			oper = (OpExpr *)node;
 
 			/* get operator name, kind, argument type and schema */
 			tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(oper->opno));
@@ -5543,7 +5649,7 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 			pfree(opername);
 			break;
 		case T_ScalarArrayOpExpr:
-			arrayoper = (ScalarArrayOpExpr *)expr;
+			arrayoper = (ScalarArrayOpExpr *)node;
 
 			/* get operator name, left argument type and schema */
 			tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(arrayoper->opno));
@@ -5690,10 +5796,10 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 			break;
 		case T_NullIfExpr:
 			/* get argument type */
-			tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(((NullIfExpr *)expr)->opno));
+			tuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(((NullIfExpr *)node)->opno));
 			if (! HeapTupleIsValid(tuple))
 			{
-				elog(ERROR, "cache lookup failed for operator %u", ((NullIfExpr *)expr)->opno);
+				elog(ERROR, "cache lookup failed for operator %u", ((NullIfExpr *)node)->opno);
 			}
 			rightargtype = ((Form_pg_operator)GETSTRUCT(tuple))->oprright;
 			ReleaseSysCache(tuple);
@@ -5701,12 +5807,12 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 			if (! canHandleType(rightargtype))
 				return NULL;
 
-			left = deparseExpr(linitial(((NullIfExpr *)expr)->args), context);
+			left = deparseExpr(linitial(((NullIfExpr *)node)->args), context);
 			if (left == NULL)
 			{
 				return NULL;
 			}
-			right = deparseExpr(lsecond(((NullIfExpr *)expr)->args), context);
+			right = deparseExpr(lsecond(((NullIfExpr *)node)->args), context);
 			if (right == NULL)
 			{
 				pfree(left);
@@ -5718,7 +5824,7 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 
 			break;
 		case T_BoolExpr:
-			boolexpr = (BoolExpr *)expr;
+			boolexpr = (BoolExpr *)node;
 
 			arg = deparseExpr(linitial(boolexpr->args), context);
 			if (arg == NULL)
@@ -5746,13 +5852,13 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 
 			break;
 		case T_RelabelType:
-			return deparseExpr(((RelabelType *)expr)->arg, context);
+			return deparseExpr(((RelabelType *)node)->arg, context);
 			break;
 		case T_CoerceToDomain:
-			return deparseExpr(((CoerceToDomain *)expr)->arg, context);
+			return deparseExpr(((CoerceToDomain *)node)->arg, context);
 			break;
 		case T_CaseExpr:
-			caseexpr = (CaseExpr *)expr;
+			caseexpr = (CaseExpr *)node;
 
 			if (! canHandleType(caseexpr->casetype))
 				return NULL;
@@ -5837,7 +5943,7 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 			appendStringInfo(&result, " END");
 			break;
 		case T_CoalesceExpr:
-			coalesceexpr = (CoalesceExpr *)expr;
+			coalesceexpr = (CoalesceExpr *)node;
 
 			if (! canHandleType(coalesceexpr->coalescetype))
 				return NULL;
@@ -5871,9 +5977,9 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 
 			break;
 		case T_NullTest:
-			rightexpr = ((NullTest *)expr)->arg;
+			rightexpr = ((NullTest *)node)->arg;
 
-			/* since booleans are translated as (expr <> 0), we cannot push them down */
+			/* since booleans are translated as (node <> 0), we cannot push them down */
 			if (exprType((Node *)rightexpr) == BOOLOID)
 				return NULL;
 
@@ -5884,10 +5990,10 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 			initStringInfo(&result);
 			appendStringInfo(&result, "(%s IS %sNULL)",
 					arg,
-					((NullTest *)expr)->nulltesttype == IS_NOT_NULL ? "NOT " : "");
+					((NullTest *)node)->nulltesttype == IS_NOT_NULL ? "NOT " : "");
 			break;
 		case T_FuncExpr:
-			func = (FuncExpr *)expr;
+			func = (FuncExpr *)node;
 			opername = NULL;
 			origin_function = NULL;
 
@@ -6089,7 +6195,7 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 			/*
 			 * We will only handle casts of 'now'.
 			 */
-			coerce = (CoerceViaIO *)expr;
+			coerce = (CoerceViaIO *)node;
 
 			/* only casts to these types are handled */
 			if (coerce->resulttype != DATEOID
@@ -6135,7 +6241,7 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 			break;
 #if PG_VERSION_NUM >= 100000
 		case T_SQLValueFunction:
-			sqlvalfunc = (SQLValueFunction *)expr;
+			sqlvalfunc = (SQLValueFunction *)node;
 
 			switch (sqlvalfunc->op)
 			{
@@ -6160,12 +6266,12 @@ deparseExpr(Expr *expr, deparse_expr_cxt *context)
 		case T_Aggref:
 			{
 				initStringInfo(&result);
-				result.data = oracleDeparseAggref((Aggref *) expr, context);
+				result.data = oracleDeparseAggref((Aggref *) node, context);
 			}
 			break;
 		case T_MinMaxExpr:
 			{
-				minmaxexpr = (MinMaxExpr *)expr;
+				minmaxexpr = (MinMaxExpr *)node;
 
 				initStringInfo(&result);
 
@@ -9408,7 +9514,11 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 		 */
 		context.handle_aggref = true;
 
-		/* Check whether this expression is part of GROUP BY clause */
+		/*
+		 * Check whether this expression is part of GROUP BY clause.  Note we
+		 * check the whole GROUP BY clause not just processed_groupClause,
+		 * because we will ship all of it, cf. appendGroupByClause.
+		 */
 		if (sgref && get_sortgroupref_clause_noerr(sgref, query->groupClause))
 		{
 			TargetEntry *tle;
@@ -9480,10 +9590,10 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 				 */
 				foreach(l, aggvars)
 				{
-					Expr	   *expr = (Expr *) lfirst(l);
+					Expr	   *aggref = (Expr *) lfirst(l);
 
-					if (IsA(expr, Aggref))
-						tlist = add_to_flat_tlist(tlist, list_make1(expr));
+					if (IsA(aggref, Aggref))
+						tlist = add_to_flat_tlist(tlist, list_make1(aggref));
 				}
 			}
 		}
@@ -9500,8 +9610,6 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	 */
 	if (havingQual)
 	{
-		ListCell   *lc;
-
 		foreach(lc, (List *) havingQual)
 		{
 			Expr	   *expr = (Expr *) lfirst(lc);
@@ -9517,6 +9625,9 @@ foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 									  true,
 									  false,
 									  false,
+#if PG_VERSION_NUM >= 160000
+									  false,
+#endif
 									  root->qual_security_level,
 									  grouped_rel->relids,
 									  NULL,
@@ -9776,11 +9887,19 @@ estimate_path_cost_size(PlannerInfo *root,
 		}
 
 		/* Get number of grouping columns and possible number of groups */
+#if PG_VERSION_NUM >= 160000
+		numGroupCols = list_length(root->processed_groupClause);
+		numGroups = estimate_num_groups(root,
+										get_sortgrouplist_exprs(root->processed_groupClause,
+																fpinfo->grouped_tlist),
+										input_rows,
+#else
 		numGroupCols = list_length(root->parse->groupClause);
 		numGroups = estimate_num_groups(root,
 										get_sortgrouplist_exprs(root->parse->groupClause,
 																fpinfo->grouped_tlist),
 										input_rows,
+#endif
 #if PG_VERSION_NUM >= 140000
 										NULL,
 #endif
@@ -9790,7 +9909,11 @@ estimate_path_cost_size(PlannerInfo *root,
 		 * Get the retrieved_rows and rows estimates.  If there are HAVING
 		 * quals, account for their selectivity.
 		 */
+#if PG_VERSION_NUM >= 160000
+		if (root->hasHavingQual)
+#else
 		if (root->parse->havingQual)
+#endif
 		{
 			/* Factor in the selectivity of the remotely-checked quals */
 			retrieved_rows =
@@ -9838,7 +9961,7 @@ estimate_path_cost_size(PlannerInfo *root,
 		run_cost += cpu_tuple_cost * numGroups;
 
 		/* Account for the eval cost of HAVING quals, if any */
-		if (root->parse->havingQual)
+		if (root->hasHavingQual)
 		{
 			QualCost remote_cost;
 
@@ -10024,7 +10147,11 @@ adjust_foreign_grouping_path_cost(PlannerInfo *root,
 	 * pathkeys, adjust the costs with that function.  Otherwise, adjust the
 	 * costs by applying the same heuristic as for the scan or join case.
 	 */
+#if PG_VERSION_NUM >= 160000
+	if (!grouping_is_sortable(root->processed_groupClause) ||
+#else
 	if (!grouping_is_sortable(root->parse->groupClause) ||
+#endif
 		!pathkeys_contained_in(pathkeys, root->group_pathkeys))
 	{
 		Path		sort_path;	/* dummy for result of cost_sort */
@@ -10604,8 +10731,9 @@ oracleDeparseRangeTblRef(StringInfo buf, RelOptInfo *foreignrel,
 {
 	struct OracleFdwState *fpinfo = (struct OracleFdwState *) foreignrel->fdw_private;
 	PlannerInfo *root = context->root;
+#ifdef USE_ASSERT_CHECKING
 	Index ignore_rel = context->ignore_rel;
-
+#endif
 	/* Should only be called in these cases. */
 	Assert(IS_SIMPLE_REL(foreignrel) || IS_JOIN_REL(foreignrel));
 
@@ -10683,6 +10811,13 @@ oracleAppendGroupByClause(List *tlist, deparse_expr_cxt *context)
 	 */
 	Assert(!query->groupingSets);
 
+	/*
+	 * We intentionally print query->groupClause not processed_groupClause,
+	 * leaving it to the remote planner to get rid of any redundant GROUP BY
+	 * items again.  This is necessary in case processed_groupClause reduced
+	 * to empty, and in any case the redundancy situation on the remote might
+	 * be different than what we think here.
+	 */
 	foreach(lc, query->groupClause)
 	{
 		SortGroupClause *grp = (SortGroupClause *) lfirst(lc);
@@ -11430,7 +11565,11 @@ find_modifytable_subplan(PlannerInfo *root,
 	{
 		ForeignScan *fscan = (ForeignScan *) subplan;
 
+#if PG_VERSION_NUM >= 160000
+		if (bms_is_member(rtindex, fscan->fs_base_relids))
+#else
 		if (bms_is_member(rtindex, fscan->fs_relids))
+#endif
 			return fscan;
 	}
 
@@ -12158,4 +12297,499 @@ execute_dml_stmt(ForeignScanState *node)
 	dmstate->rowcount = oracleExecuteQuery(dmstate->session, dmstate->oraTable, dmstate->paramList);
 
 	MemoryContextSwitchTo(oldcontext);
+}
+
+static void
+oracleExecForeignDDLRelease(struct OracleFdwState *fdwState)
+{
+	/* release the Oracle session */
+	oracleCloseStatement(fdwState->session);
+	oracleFree(fdwState->session);
+	pfree(fdwState->oraTable->cols[0]->val);
+	pfree(fdwState->oraTable->cols[0]->val_len);
+	pfree(fdwState->oraTable->cols[0]->val_len4);
+	pfree(fdwState->oraTable->cols[0]->val_null);
+	oracleFree(fdwState->oraTable);
+
+	pfree(fdwState);
+}
+
+/*
+ * ExecForeignDDL is a public function that is called by core code.
+ * It executes DDL command on remote server.
+ *
+ * serverOid: remote server to get connected
+ * rel: relation to be created
+ * operation:
+ * 		0: CREATE command
+ * 		1: DROP command
+ * exists_flag: 
+ * 		in CREATE DDL: true if `IF NOT EXIST` is specified
+ * 		in DROP DDL: true if `IF EXIST` is specified
+ *
+ */
+int
+#if (PG_VERSION_NUM >=160000)
+PGDLLEXPORT
+#endif
+ExecForeignDDL(Oid serverOid,
+			   Relation rel,
+			   int operation,
+			   bool exists_flag)
+{
+	StringInfoData sql;
+	ForeignTable *foreignTable;
+	struct OracleFdwState *fdwState = palloc0(sizeof(struct OracleFdwState));
+	const char *tablename;
+	List *options;
+	ListCell *cell;
+	char *isolationlevel = NULL;
+	char *nchar = NULL;
+	int rowcount;
+
+	elog(DEBUG1, "oracle_fdw: %s", __func__);
+
+	if (operation != 0 && operation != 1)
+	{
+		elog(ERROR, "Only support CREATE/DROP DATASOURCE");
+	}
+
+	/* obtain additional catalog information. */
+	foreignTable = GetForeignTable(RelationGetRelid(rel));
+	tablename = get_rel_name(foreignTable->relid);
+
+	/*
+	 * Get all relevant options from the foreign table, the user mapping,
+	 * the foreign server and the foreign data wrapper.
+	 */
+	oracleGetOptions(foreignTable->relid, GetUserId(), &options);
+	foreach(cell, options)
+	{
+		DefElem *def = (DefElem *) lfirst(cell);
+		if (strcmp(def->defname, OPT_NLS_LANG) == 0)
+			fdwState->nls_lang = strVal(def->arg);
+		if (strcmp(def->defname, OPT_DBSERVER) == 0)
+			fdwState->dbserver = strVal(def->arg);
+		if (strcmp(def->defname, OPT_ISOLATION_LEVEL) == 0)
+			isolationlevel = strVal(def->arg);
+		if (strcmp(def->defname, OPT_USER) == 0)
+			fdwState->user = strVal(def->arg);
+		if (strcmp(def->defname, OPT_PASSWORD) == 0)
+			fdwState->password = strVal(def->arg);
+		if (strcmp(def->defname, OPT_NCHAR) == 0)
+			nchar = strVal(def->arg);
+		if (strcmp(def->defname, OPT_TABLE) == 0)
+			tablename = strVal(def->arg);
+	}
+
+	/* set isolation_level (or use default) */
+	if (isolationlevel == NULL)
+		fdwState->isolation_level = DEFAULT_ISOLATION_LEVEL;
+	else
+		fdwState->isolation_level = getIsolationLevel(isolationlevel);
+
+	/* convert "nchar" option to boolean (or use "false") */
+	if (nchar != NULL
+		&& (pg_strcasecmp(nchar, "on") == 0
+			|| pg_strcasecmp(nchar, "yes") == 0
+			|| pg_strcasecmp(nchar, "true") == 0))
+		fdwState->have_nchar = true;
+	else
+		fdwState->have_nchar = false;
+
+	/* guess a good NLS_LANG environment setting */
+	fdwState->nls_lang = guessNlsLang(fdwState->nls_lang);
+
+	/*
+	 * Get connection to the foreign server.  Connection manager will
+	 * establish new connection if necessary.
+	 */
+	fdwState->session = oracleGetSession(
+		fdwState->dbserver,
+		fdwState->isolation_level,
+		fdwState->user,
+		fdwState->password,
+		fdwState->nls_lang,
+		(int)fdwState->have_nchar,
+		NULL,
+		GetCurrentTransactionNestLevel()
+	);
+
+	/*
+	 * Oracle reports error when creating an existed table or when dropping a non-existed table.
+	 * So checking table is existed or not before creating/dropping.
+	 * Oracle table name must be written exactly as it is in Oracle, so normally in uppercase.
+	 */
+	initStringInfo(&sql);
+	appendStringInfo(&sql, "SELECT TABLE_NAME FROM USER_TABLES WHERE TABLE_NAME = '%s'", tablename);
+
+	fdwState->oraTable = oracleDescribe(fdwState->session, sql.data, "USER_TABLE", NULL, DEFAULT_MAX_LONG);
+	fdwState->oraTable->npgcols = 1;
+	fdwState->oraTable->cols[0]->pgattnum = 1;
+	fdwState->oraTable->cols[0]->pgtype = TEXTOID;
+	fdwState->oraTable->cols[0]->pgtypmod = -1;
+	fdwState->oraTable->cols[0]->pgname = "TABLE_NAME";
+	fdwState->oraTable->cols[0]->used = 1;
+	fdwState->oraTable->cols[0]->val = (char *)palloc(fdwState->oraTable->cols[0]->val_size + 1);
+	fdwState->oraTable->cols[0]->val_len = (unsigned int *)palloc0(sizeof(unsigned int));
+	fdwState->oraTable->cols[0]->val_len4 = (unsigned int *)palloc0(sizeof(unsigned int));
+	fdwState->oraTable->cols[0]->val_null = (short *)palloc(sizeof(short));
+	memset(fdwState->oraTable->cols[0]->val_null, 1, sizeof(short));
+
+	PG_TRY();
+	{
+		/* execute query */
+		oraclePrepareQuery(fdwState->session, sql.data, fdwState->oraTable, DEFAULT_PREFETCH);
+		rowcount = oracleExecuteQuery(fdwState->session, fdwState->oraTable, NULL);
+
+		if (exists_flag)
+		{
+			if (rowcount == 1 && operation == 0)
+			{
+				/* Creating an existed table */
+				goto exit;
+			}
+			else if (rowcount == 0 && operation == 1)
+			{
+				/* Dropping a non-existed table */
+				goto exit;
+			}
+		}
+
+		resetStringInfo(&sql);
+		/* create DDL query */
+		if (operation == 0)
+			oracleDeparseCreateTableSql(&sql, rel, foreignTable);
+		else
+			oracleDeparseDropTableSql(&sql, rel);
+
+		oracleExecuteCall(fdwState->session, sql.data);
+exit: ;
+	}
+	PG_CATCH();
+	{
+		/* release the Oracle session */
+		pfree(sql.data);
+		oracleExecForeignDDLRelease(fdwState);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/* release the Oracle session */
+	pfree(sql.data);
+	oracleExecForeignDDLRelease(fdwState);
+
+	return 0;
+}
+
+/*
+ * Get Const node from expression.
+ */
+static bool
+oracle_get_default_const_walker(Node *node, oracle_default_const_ctx * ctx)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Const))
+	{
+		ctx->c = (Const *)node;
+		return true;
+	}
+	else if (IsA(node, FuncExpr))
+	{
+		FuncExpr *func = (FuncExpr *)node;
+		ListCell *lc;
+
+		/* Function gets a text type and returns type of corresponding column type */
+		foreach(lc, func->args)
+		{
+			Node * n = (Node *) lfirst(lc);
+
+			if (IsA(n, Const))
+			{
+				Const *c = (Const *) n;
+
+				if (c->consttype == TEXTOID)
+				{
+					ctx->c = (Const *)node;
+					return true;
+				}
+			}
+		}
+	}
+	return expression_tree_walker(node, oracle_get_default_const_walker, (void *) ctx);
+}
+
+/*
+ * Construct CREATE TABLE statement
+ *
+ */
+static void
+oracleDeparseCreateTableSql(StringInfo buf, Relation rel, ForeignTable *foreigntable)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	TupleConstr *tupConstr = tupdesc->constr;
+	int			i;
+	char	   *colname;
+	List	   *options;
+	ListCell   *lc;
+	bool		first = true;
+	/* index to the position of current Default Value List */
+	int 		defValIndex = 0;
+
+	appendStringInfoString(buf, "CREATE TABLE ");
+	oracleDeparseRelation(buf, rel);
+	appendStringInfoString(buf, " (");
+
+	/* deparse column */
+	for (i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		char *is_key = NULL;
+
+		/* Ignore dropped columns. */
+		if (att->attisdropped)
+			continue;
+
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		first = false;
+
+		/* Use attribute name or column_name option. */
+		colname = NameStr(att->attname);
+		options = GetForeignColumnOptions(RelationGetRelid(rel), i + 1);
+
+		foreach(lc, options)
+		{
+			DefElem    *def = (DefElem *) lfirst(lc);
+
+			if (strcmp(def->defname, "column_name") == 0)
+				colname = defGetString(def);
+			else if (strcmp(def->defname, "key") == 0)
+				is_key = defGetString(def);
+		}
+
+		appendStringInfo(buf, "%s %s", quote_identifier(colname), oracleDeparseTypeName(att->atttypid, att->atttypmod));
+
+		/* deparse DEFAULT value */
+		if (att->atthasdef) {
+			Node	    *node = (Node *) stringToNode(tupConstr->defval[defValIndex].adbin);
+			oracle_default_const_ctx ctx;
+			Const *cnode;
+			bool	    isDefaultConst = false;
+
+			isDefaultConst = oracle_get_default_const_walker(node, &ctx);
+			if (!isDefaultConst)
+				elog(ERROR, "Default value of %s is not supported", colname);
+
+			/* Get const node */
+			cnode = ctx.c;
+
+			appendStringInfoString(buf, " DEFAULT ");
+
+			/* The attribute is a constant */
+			if (cnode->constisnull)
+			{
+				/* only translate NULLs of a type Oracle can handle */
+				if (canHandleType(cnode->consttype))
+				{
+					/*
+					 * for creating oraTable, to get attributes of remote table we need to define output datatype
+					 * todo: Need to add more types in appendAsType
+					 */
+					castNullAsType(buf, cnode->consttype);
+				}
+			}
+			else
+			{
+				/* get a string representation of the value */
+				char *c = datumToString(cnode->constvalue, cnode->consttype);
+
+				appendStringInfo(buf, "%s", c);
+			}
+
+			defValIndex ++;
+		}
+
+		/* In foreign table, key option of column can be "yes" or "true", so we have to check both of them */
+		if (is_key != NULL &&
+			(strcmp(is_key, "yes") == 0 || strcmp(is_key, "true") == 0))
+			appendStringInfo(buf, " %s", "PRIMARY KEY");
+
+		/* In ORACLE, key column is set to NOT NULL automatically, so we append NOT NULL for the column that is not key */
+		if (att->attnotnull && is_key == NULL)
+			appendStringInfo(buf, " %s", "NOT NULL");
+	}
+	appendStringInfoString(buf, ")");
+}
+
+/*
+ * Construct DROP TABLE statement
+ *
+ */
+static void
+oracleDeparseDropTableSql(StringInfo buf, Relation rel)
+{
+	appendStringInfo(buf, "DROP TABLE ");
+	oracleDeparseRelation(buf, rel);
+}
+
+/*
+ * Deparse relation (table name)
+ *
+ */
+static void
+oracleDeparseRelation(StringInfo buf, Relation rel)
+{
+	ForeignTable *table;
+	const char *relname = NULL;
+	ListCell *lc;
+
+	/* obtain additional catalog information. */
+	table = GetForeignTable(RelationGetRelid(rel));
+
+	/*
+	 * Use value of FDW options if any, instead of the name of object itself.
+	 */
+	foreach(lc, table->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "table") == 0)
+		{
+			relname = defGetString(def);
+			break;
+		}
+	}
+
+	/*
+	 * Note: we could skip printing the schema name if it's pg_catalog, but
+	 * that doesn't seem worth the trouble.
+	 */
+	if (relname == NULL)
+		relname = RelationGetRelationName(rel);
+
+	relname = oracleCreateTableName(NULL, NULL, (char *) relname);
+	appendStringInfo(buf, "%s", relname);
+}
+
+/*
+ * Deparse type of column
+ *
+ */
+static char *
+oracleDeparseTypeName(Oid type_oid, int32 typemod)
+{
+	char *rs = NULL;
+	HeapTuple tuple;
+	Form_pg_type typeform;
+
+	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+	typeform = (Form_pg_type) GETSTRUCT(tuple);
+	ReleaseSysCache(tuple);
+
+	/* data type */
+	switch (type_oid)
+	{
+		case CHAROID:
+		{
+			if (typemod > 0)
+			{
+				rs = oraclePrintTypmod("VARCHAR", typemod, typeform->typmodout);
+			}
+			else
+			{
+				rs = "CHAR";
+			}
+			break;
+		}
+		case VARCHAROID:
+		case BPCHAROID:
+		{
+			if (typemod > 0)
+			{
+				rs = oraclePrintTypmod("VARCHAR", typemod, typeform->typmodout);
+			}
+			break;
+		}
+		case TEXTOID:
+			rs = "CLOB";
+			break;
+		case JSONOID:
+			rs = "CLOB";
+			break;
+		case BYTEAOID:
+			rs = "BLOB";
+			break;
+		case BOOLOID:
+			rs = "NUMBER";
+			break;
+		case FLOAT4OID:
+		case FLOAT8OID:
+			rs = "FLOAT";
+			break;
+		case INT2OID:
+			rs = "NUMBER(5)";
+			break;
+		case INT4OID:
+			rs = "NUMBER(10)";
+			break;
+		case INT8OID:
+			rs = "NUMBER(19)";
+			break;
+		case NUMERICOID:
+			rs = "NUMBER";
+			break;
+		case UUIDOID:
+			rs = "RAW(64)";
+			break;
+		case DATEOID:
+			rs = "DATE";
+			break;
+		case INTERVALOID:
+			rs = "INTERVAL DAY TO SECOND";
+			break;
+		case TIMESTAMPOID:
+			rs = "TIMESTAMP";
+			break;
+		case TIMESTAMPTZOID:
+			rs = "TIMESTAMP WITH TIME ZONE";
+			break;
+		case XMLOID:
+			rs = "CLOB";
+			break;
+	}
+
+	return rs;
+}
+
+/*
+ * Add typmod decoration to the basic type name
+ */
+static char *
+oraclePrintTypmod(const char *typname, int32 typmod, Oid typmodout)
+{
+	char	   *res;
+
+	/* Shouldn't be called if typmod is -1 */
+	Assert(typmod >= 0);
+
+	if (typmodout == InvalidOid)
+	{
+		/* Default behavior: just print the integer typmod with parens */
+		res = psprintf("%s(%d)", typname, (int) typmod);
+	}
+	else
+	{
+		/* Use the type-specific typmodout procedure */
+		char	   *tmstr;
+
+		tmstr = DatumGetCString(OidFunctionCall1(typmodout,
+												 Int32GetDatum(typmod)));
+		res = psprintf("%s%s", typname, tmstr);
+	}
+
+	return res;
 }

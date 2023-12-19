@@ -6,6 +6,7 @@ export ORACLE_SID=XE
 export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH
 
 sed -i 's/REGRESS =.*/REGRESS = oracle_fdw oracle_gis oracle_import oracle_join oracle_extra oracle_fdw_post selectfunc /' Makefile
+
 make clean
 make $1
 make check $1 | tee make_check.out
